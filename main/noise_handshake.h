@@ -59,6 +59,7 @@ typedef struct {
     bool has_recipient;
     bool is_compressed;
     bool is_rsr;               /* flag 0x10: solicited sync response replay */
+    bool opaque_only;          /* v2: validated and relayed, never interpreted */
     uint8_t *payload;
     uint16_t payload_len;
     uint8_t signature[64];

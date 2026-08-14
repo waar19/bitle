@@ -172,6 +172,11 @@ static void dispatch_packet(uint16_t link_handle, const bitchat_packet_t *packet
              is_broadcast_recipient(packet) ? "bcast" : (is_local_recipient(packet) ? "us" : "other"),
              packet->is_compressed ? " (compressed)" : "");
 
+    if (packet->opaque_only) {
+        ESP_LOGD(TAG, "v2 packet retained as opaque relay traffic");
+        return;
+    }
+
     /* Harvest wall time only from directly-connected peers (packets still at
      * their origin TTL). Announces flow through the authoritative path (which
      * knows the sender's infra/authority status); other direct packet types
@@ -239,72 +244,31 @@ static void dispatch_packet(uint16_t link_handle, const bitchat_packet_t *packet
 #define RELAY_CACHE_SIZE 64
 
 static uint64_t s_relay_seen[RELAY_CACHE_SIZE];
+static bool s_relay_seen_used[RELAY_CACHE_SIZE];
 static size_t s_relay_seen_next;
-
-static size_t relay_wire_len(const uint8_t *data, size_t len)
-{
-    if (!data || len < 22) {
-        return len;
-    }
-    uint8_t version = data[0];
-    uint8_t flags = data[11];
-    size_t header_len;
-    size_t payload_len;
-    if (version == 1) {
-        header_len = 22;
-        payload_len = ((size_t)data[12] << 8) | data[13];
-    } else if (version == 2 && len >= 24) {
-        header_len = 24;
-        payload_len = ((size_t)data[12] << 24) |
-                      ((size_t)data[13] << 16) |
-                      ((size_t)data[14] << 8) |
-                      data[15];
-    } else {
-        return len;
-    }
-
-    size_t wire_len = header_len;
-    if (flags & 0x01) {
-        wire_len += 8;
-    }
-    if (version == 2 && (flags & 0x08)) {
-        if (wire_len >= len) {
-            return len;
-        }
-        wire_len += 1 + (size_t)data[wire_len] * 8;
-    }
-    wire_len += payload_len;
-    if (flags & 0x02) {
-        wire_len += 64;
-    }
-    return wire_len <= len ? wire_len : len;
-}
 
 static uint64_t relay_fingerprint(const uint8_t *data, size_t len)
 {
-    /* FNV-1a over canonical opaque packet bytes: transport padding is omitted,
-     * TTL is zeroed, and the replay-only RSR flag is cleared. */
-    size_t canonical_len = relay_wire_len(data, len);
-    uint64_t hash = 1469598103934665603ULL;
-    for (size_t i = 0; i < canonical_len; ++i) {
-        if (i == 2) {
-            continue;
-        }
-        uint8_t byte = i == 11 ? (data[i] & (uint8_t)~0x10) : data[i];
-        hash ^= byte;
-        hash *= 1099511628211ULL;
+    uint8_t digest[16];
+    if (!bitchat_relay_fingerprint(data, len, digest)) {
+        return 0;
     }
-    return hash;
+    uint64_t fingerprint = 0;
+    for (int i = 0; i < 8; ++i) {
+        fingerprint = (fingerprint << 8) | digest[i];
+    }
+    return fingerprint;
 }
 
 static bool relay_seen_before(uint64_t fingerprint)
 {
     for (size_t i = 0; i < RELAY_CACHE_SIZE; ++i) {
-        if (s_relay_seen[i] == fingerprint) {
+        if (s_relay_seen_used[i] && s_relay_seen[i] == fingerprint) {
             return true;
         }
     }
     s_relay_seen[s_relay_seen_next] = fingerprint;
+    s_relay_seen_used[s_relay_seen_next] = true;
     s_relay_seen_next = (s_relay_seen_next + 1) % RELAY_CACHE_SIZE;
     return false;
 }
@@ -364,7 +328,7 @@ bool bitle_mesh_inbound(uint16_t link_handle, uint8_t *buffer, uint16_t len)
     dispatch_packet(link_handle, &packet);
     /* Dead-drop: keep recent signed public packets so passing phones can
      * sync from us later (the module filters types and enforces budgets). */
-    if (!packet.is_compressed) {
+    if (!packet.is_compressed && !packet.opaque_only) {
         bitle_sync_ingest(&packet, buffer, len);
     }
     relay_packet(link_handle, buffer, len, &packet);

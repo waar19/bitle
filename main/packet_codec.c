@@ -7,6 +7,7 @@
 #include "miniz.h"
 
 #include "bitchat_ble.h"
+#include "bitle_hash.h"
 #include "conformance_vectors.h"
 
 static const char *TAG = "packet_codec";
@@ -65,6 +66,20 @@ static uint16_t read_u16_be(const uint8_t *data, size_t len, size_t *offset, boo
     return value;
 }
 
+static uint32_t read_u32_be(const uint8_t *data, size_t len, size_t *offset, bool *ok)
+{
+    if (*offset + 4 > len) {
+        *ok = false;
+        return 0;
+    }
+    uint32_t value = ((uint32_t)data[*offset] << 24) |
+                     ((uint32_t)data[*offset + 1] << 16) |
+                     ((uint32_t)data[*offset + 2] << 8) |
+                     data[*offset + 3];
+    *offset += 4;
+    return value;
+}
+
 static uint64_t read_u64_be(const uint8_t *data, size_t len, size_t *offset, bool *ok)
 {
     if (*offset + 8 > len) {
@@ -108,6 +123,76 @@ static bool decode_hex_fixture(const char *hex, uint8_t *out, size_t out_cap, si
     return true;
 }
 
+static size_t relay_wire_len(const uint8_t *data, size_t len)
+{
+    if (!data || len < 22) {
+        return 0;
+    }
+    uint8_t version = data[0];
+    uint8_t flags = data[11];
+    size_t header_len;
+    size_t payload_len;
+    if (version == 1) {
+        header_len = 22;
+        payload_len = ((size_t)data[12] << 8) | data[13];
+    } else if (version == 2 && len >= 24) {
+        header_len = 24;
+        payload_len = ((size_t)data[12] << 24) |
+                      ((size_t)data[13] << 16) |
+                      ((size_t)data[14] << 8) |
+                      data[15];
+    } else {
+        return 0;
+    }
+    size_t wire_len = header_len;
+    if (flags & 0x01) {
+        wire_len += 8;
+    }
+    if (version == 2 && (flags & 0x08)) {
+        if (wire_len >= len) {
+            return 0;
+        }
+        size_t route_len = 1 + (size_t)data[wire_len] * 8;
+        if (route_len > len - wire_len) {
+            return 0;
+        }
+        wire_len += route_len;
+    }
+    if (wire_len > len) {
+        return 0;
+    }
+    size_t trailer_len = (flags & 0x02) ? 64 : 0;
+    if (payload_len > len - wire_len ||
+        trailer_len > len - wire_len - payload_len) {
+        return 0;
+    }
+    wire_len += payload_len + trailer_len;
+    return wire_len;
+}
+
+bool bitchat_relay_fingerprint(const uint8_t *data, size_t len, uint8_t out[16])
+{
+    size_t canonical_len = relay_wire_len(data, len);
+    if (canonical_len < 12 || !out) {
+        return false;
+    }
+    bitle_sha256_ctx_t ctx;
+    bitle_sha256_begin(&ctx);
+    bitle_sha256_update(&ctx, data, 2);
+    const uint8_t zero = 0;
+    bitle_sha256_update(&ctx, &zero, 1);
+    bitle_sha256_update(&ctx, data + 3, 8);
+    const uint8_t canonical_flags = data[11] & (uint8_t)~0x10;
+    bitle_sha256_update(&ctx, &canonical_flags, 1);
+    if (canonical_len > 12) {
+        bitle_sha256_update(&ctx, data + 12, canonical_len - 12);
+    }
+    uint8_t digest[32];
+    bitle_sha256_finish(&ctx, digest);
+    memcpy(out, digest, 16);
+    return true;
+}
+
 bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *out_packet)
 {
     if (!data || !out_packet || len == 0) {
@@ -122,9 +207,17 @@ bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *ou
     out_packet->ttl = read_u8(data, len, &offset, &ok);
     out_packet->timestamp_ms = read_u64_be(data, len, &offset, &ok);
     uint8_t flags = read_u8(data, len, &offset, &ok);
-    uint16_t payload_len = read_u16_be(data, len, &offset, &ok);
+    uint32_t payload_len = 0;
+    if (out_packet->version == 1) {
+        payload_len = read_u16_be(data, len, &offset, &ok);
+    } else if (out_packet->version == 2) {
+        payload_len = read_u32_be(data, len, &offset, &ok);
+        out_packet->opaque_only = true;
+    } else {
+        ok = false;
+    }
 
-    if (!ok || out_packet->version != 1) {
+    if (!ok || payload_len > UINT16_MAX) {
         ESP_LOGW(TAG, "Invalid packet header");
         return false;
     }
@@ -151,6 +244,16 @@ bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *ou
         offset += 8;
     }
 
+    if (out_packet->version == 2 && (flags & 0x08)) {
+        uint8_t route_count = read_u8(data, len, &offset, &ok);
+        size_t route_len = (size_t)route_count * 8;
+        if (!ok || route_len > len - offset) {
+            ESP_LOGW(TAG, "Invalid v2 route");
+            return false;
+        }
+        offset += route_len;
+    }
+
     if (offset + payload_len > len) {
         ESP_LOGW(TAG, "Payload length exceeds buffer");
         return false;
@@ -164,13 +267,13 @@ bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *ou
         }
         memcpy(out_packet->payload, data + offset, payload_len);
     }
-    out_packet->payload_len = payload_len;
+    out_packet->payload_len = (uint16_t)payload_len;
     offset += payload_len;
 
     /* Compressed payload (v1): [2-byte original size BE][raw deflate].
      * Wrapped zlib is accepted for read compatibility. Every stream must end
      * exactly at the declared input and output boundaries. */
-    if (out_packet->is_compressed && payload_len > 2) {
+    if (out_packet->is_compressed && !out_packet->opaque_only && payload_len > 2) {
         uint16_t original_len = ((uint16_t)out_packet->payload[0] << 8) | out_packet->payload[1];
         if (original_len > 0) {
             uint8_t *inflated = inflate_payload(out_packet->payload + 2, payload_len - 2, original_len);
@@ -188,7 +291,7 @@ bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *ou
             bitchat_packet_free(out_packet);
             return false;
         }
-    } else if (out_packet->is_compressed) {
+    } else if (out_packet->is_compressed && !out_packet->opaque_only) {
         bitchat_packet_free(out_packet);
         return false;
     }
@@ -224,7 +327,7 @@ bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *ou
 
 bool bitchat_packet_encode(const bitchat_packet_t *packet, uint8_t *out_buf, size_t *out_len, size_t max_len)
 {
-    if (!packet || !out_buf || !out_len) {
+    if (!packet || !out_buf || !out_len || packet->version != 1) {
         return false;
     }
     size_t offset = 0;
@@ -377,7 +480,31 @@ bool packet_codec_self_test(void)
                 bitchat_packet_free(&fixture_packet);
                 return false;
             }
+            if (strcmp(vector->id, "packet.v2.route_signed") == 0 &&
+                (!fixture_packet.opaque_only ||
+                 fixture_packet.version != 2 ||
+                 fixture_packet.payload_len != 8 ||
+                 memcmp(fixture_packet.payload, "route-v2", 8) != 0)) {
+                bitchat_packet_free(&fixture_packet);
+                return false;
+            }
             bitchat_packet_free(&fixture_packet);
+        }
+    }
+    for (size_t i = 0; i < CONFORMANCE_FINGERPRINT_VECTOR_COUNT; ++i) {
+        const conformance_fingerprint_vector_t *vector =
+            &CONFORMANCE_FINGERPRINT_VECTORS[i];
+        size_t fixture_len = 0;
+        uint8_t expected[16];
+        size_t expected_len = 0;
+        uint8_t actual[16];
+        if (!decode_hex_fixture(vector->hex, encoded, sizeof(encoded), &fixture_len) ||
+            !decode_hex_fixture(vector->expected, expected, sizeof(expected), &expected_len) ||
+            expected_len != sizeof(expected) ||
+            !bitchat_relay_fingerprint(encoded, fixture_len, actual) ||
+            memcmp(actual, expected, sizeof(expected)) != 0) {
+            ESP_LOGE(TAG, "Fingerprint conformance disagrees: %s", vector->id);
+            return false;
         }
     }
     return true;

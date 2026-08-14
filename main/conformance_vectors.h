@@ -10,12 +10,14 @@ typedef struct {
 
 static const conformance_packet_vector_t CONFORMANCE_PACKET_VECTORS[] = {
     {"packet.v1.message", "01020700000000000000010000030102030405060708616263", true},
+    {"packet.v2.route_signed", "02020701020304050607080b000000080102030405060708ffffffffffffffff0210111213141516172021222324252627726f7574652d763255555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555", true},
     {"packet.v1.raw_deflate", "010107000000000000000104000d010203040506070800b46360646266616518522400", true},
     {"packet.v1.zlib_read", "0101070000000000000001040013010203040506070800b4789c63606462666165185224009dbc01c3", true},
     {"packet.invalid.version", "03020700000000000000010000030102030405060708616263", false},
     {"packet.invalid.header_truncated", "010207", false},
     {"packet.invalid.payload_truncated", "01020700000000000000010000040102030405060708616263", false},
     {"packet.invalid.signature_truncated", "01020700000000000000010200000102030405060708", false},
+    {"packet.invalid.route_truncated", "020207000000000000000108000000010102030405060708021011121314151617", false},
     {"packet.invalid.padding", "010207000000000000000100000301020304050607086162630203", false},
     {"packet.invalid.deflate_truncated", "010107000000000000000104000c010203040506070800b463606462666165185224", false},
     {"packet.invalid.deflate_trailing", "010107000000000000000104000e010203040506070800b4636064626661651852240058", false},
@@ -24,5 +26,41 @@ static const conformance_packet_vector_t CONFORMANCE_PACKET_VECTORS[] = {
 
 #define CONFORMANCE_PACKET_VECTOR_COUNT \
     (sizeof(CONFORMANCE_PACKET_VECTORS) / sizeof(CONFORMANCE_PACKET_VECTORS[0]))
+
+typedef struct {
+    const char *id;
+    const char *hex;
+    const char *expected;
+} conformance_fingerprint_vector_t;
+
+static const conformance_fingerprint_vector_t CONFORMANCE_FINGERPRINT_VECTORS[] = {
+    {"fingerprint.v1.message", "01020700000000000000010000030102030405060708616263", "d2960f980cd5983d2feadf811d9109a2"},
+    {"fingerprint.v2.route_signed", "02020701020304050607080b000000080102030405060708ffffffffffffffff0210111213141516172021222324252627726f7574652d763255555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555", "988b3fd49212d7fea7a0494c68574c91"},
+};
+
+#define CONFORMANCE_FINGERPRINT_VECTOR_COUNT \
+    (sizeof(CONFORMANCE_FINGERPRINT_VECTORS) / sizeof(CONFORMANCE_FINGERPRINT_VECTORS[0]))
+
+typedef struct {
+    const char *id;
+    const char *operation;
+    const char *hex;
+    bool valid;
+} conformance_auxiliary_vector_t;
+
+static const conformance_auxiliary_vector_t CONFORMANCE_AUXILIARY_VECTORS[] = {
+    {"fragment.payload.valid", "fragment.decode", "010203040506070801020304025566", true},
+    {"fragment.invalid.total_zero", "fragment.decode", "0102030405060708000000000255", false},
+    {"fragment.invalid.index_equal_total", "fragment.decode", "0102030405060708000200020255", false},
+    {"fragment.reassemble.out_of_order.0", "fragment.packet", "012007000000000000000100001701020304050607080908070605040302000000020201020700000000000000", true},
+    {"fragment.reassemble.out_of_order.1", "fragment.packet", "012007000000000000000100001c010203040506070809080706050403020001000202010000030102030405060708616263", true},
+    {"gcs.request.two_packets", "gcs.decode", "010001070200040000010003000380a78004000103", true},
+    {"gcs.invalid.p_zero", "gcs.decode", "010001000200040000010003000180", false},
+    {"courier.envelope.valid", "courier.decode", "01001081570f9c02cad65cc297a85facc44ff702000800000191a2040c60030060000306090c0f1215181b1e2124272a2d303336393c3f4245484b4e5154575a5d606366696c6f7275787b7e8184878a8d909396999c9fa2a5a8abaeb1b4b7babdc0c3c6c9cccfd2d5d8dbdee1e4e7eaedf0f3f6f9fcff0205080b0e1114171a1d04000104", true},
+    {"courier.invalid.truncated", "courier.decode", "01001000", false},
+};
+
+#define CONFORMANCE_AUXILIARY_VECTOR_COUNT \
+    (sizeof(CONFORMANCE_AUXILIARY_VECTORS) / sizeof(CONFORMANCE_AUXILIARY_VECTORS[0]))
 
 #endif
