@@ -7,14 +7,16 @@
 #include "miniz.h"
 
 #include "bitchat_ble.h"
+#include "conformance_vectors.h"
 
 static const char *TAG = "packet_codec";
 
-/* Apple's COMPRESSION_ZLIB emits raw DEFLATE (RFC 1951, no zlib wrapper);
- * the ESP32-C3 ROM ships tinfl, so inflation costs no flash. */
+/* Apple's COMPRESSION_ZLIB emits raw DEFLATE (RFC 1951). The decoder also
+ * accepts RFC 1950 zlib wrappers for read compatibility. */
 static tinfl_decompressor s_inflator;
 
-static uint8_t *inflate_payload(const uint8_t *in, size_t in_len, size_t out_len)
+static uint8_t *inflate_payload_mode(const uint8_t *in, size_t in_len, size_t out_len,
+                                     bool parse_zlib)
 {
     uint8_t *out = heap_caps_malloc(out_len, MALLOC_CAP_8BIT);
     if (!out) {
@@ -23,13 +25,24 @@ static uint8_t *inflate_payload(const uint8_t *in, size_t in_len, size_t out_len
     tinfl_init(&s_inflator);
     size_t consumed = in_len;
     size_t produced = out_len;
-    tinfl_status status = tinfl_decompress(&s_inflator, in, &consumed, out, out, &produced,
-                                           TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
-    if (status != TINFL_STATUS_DONE || produced != out_len) {
+    uint32_t flags = TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+    if (parse_zlib) {
+        flags |= TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_COMPUTE_ADLER32;
+    }
+    tinfl_status status = tinfl_decompress(&s_inflator, in, &consumed, out, out, &produced, flags);
+    if (status != TINFL_STATUS_DONE || produced != out_len || consumed != in_len) {
         heap_caps_free(out);
         return NULL;
     }
     return out;
+}
+
+static uint8_t *inflate_payload(const uint8_t *in, size_t in_len, size_t out_len)
+{
+    bool looks_zlib = in_len >= 2 && (in[0] & 0x0f) == 8 &&
+                      ((((uint16_t)in[0] << 8) | in[1]) % 31) == 0;
+    uint8_t *out = looks_zlib ? inflate_payload_mode(in, in_len, out_len, true) : NULL;
+    return out ? out : inflate_payload_mode(in, in_len, out_len, false);
 }
 
 static uint8_t read_u8(const uint8_t *data, size_t len, size_t *offset, bool *ok)
@@ -64,6 +77,35 @@ static uint64_t read_u64_be(const uint8_t *data, size_t len, size_t *offset, boo
     }
     *offset += 8;
     return value;
+}
+
+static int hex_nibble(char value)
+{
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    return -1;
+}
+
+static bool decode_hex_fixture(const char *hex, uint8_t *out, size_t out_cap, size_t *out_len)
+{
+    size_t length = strlen(hex);
+    if ((length & 1) != 0 || length / 2 > out_cap) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i += 2) {
+        int high = hex_nibble(hex[i]);
+        int low = hex_nibble(hex[i + 1]);
+        if (high < 0 || low < 0) {
+            return false;
+        }
+        out[i / 2] = (uint8_t)((high << 4) | low);
+    }
+    *out_len = length / 2;
+    return true;
 }
 
 bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *out_packet)
@@ -125,9 +167,9 @@ bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *ou
     out_packet->payload_len = payload_len;
     offset += payload_len;
 
-    /* Compressed payload (v1): [2-byte original size BE][raw deflate]. On
-     * success the packet becomes a normal one; on failure it stays marked
-     * compressed and is handled relay-only. */
+    /* Compressed payload (v1): [2-byte original size BE][raw deflate].
+     * Wrapped zlib is accepted for read compatibility. Every stream must end
+     * exactly at the declared input and output boundaries. */
     if (out_packet->is_compressed && payload_len > 2) {
         uint16_t original_len = ((uint16_t)out_packet->payload[0] << 8) | out_packet->payload[1];
         if (original_len > 0) {
@@ -139,8 +181,16 @@ bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *ou
                 out_packet->is_compressed = false;
             } else {
                 ESP_LOGW(TAG, "Failed to inflate payload (%u -> %u)", payload_len, original_len);
+                bitchat_packet_free(out_packet);
+                return false;
             }
+        } else {
+            bitchat_packet_free(out_packet);
+            return false;
         }
+    } else if (out_packet->is_compressed) {
+        bitchat_packet_free(out_packet);
+        return false;
     }
 
     if (flags & 0x02) {
@@ -152,6 +202,21 @@ bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *ou
         }
         memcpy(out_packet->signature, data + offset, 64);
         offset += 64;
+    }
+
+    if (offset < len) {
+        size_t padding_len = len - offset;
+        uint8_t padding = data[len - 1];
+        if (padding == 0 || padding != padding_len) {
+            bitchat_packet_free(out_packet);
+            return false;
+        }
+        for (size_t i = offset; i < len; ++i) {
+            if (data[i] != padding) {
+                bitchat_packet_free(out_packet);
+                return false;
+            }
+        }
     }
 
     return true;
@@ -279,6 +344,42 @@ bool packet_codec_self_test(void)
               memcmp(decoded.signature, packet.signature, sizeof(packet.signature)) == 0;
 
     bitchat_packet_free(&decoded);
-    return ok;
+    if (!ok) {
+        return false;
+    }
+
+    for (size_t i = 0; i < CONFORMANCE_PACKET_VECTOR_COUNT; ++i) {
+        const conformance_packet_vector_t *vector = &CONFORMANCE_PACKET_VECTORS[i];
+        size_t fixture_len = 0;
+        if (!decode_hex_fixture(vector->hex, encoded, sizeof(encoded), &fixture_len)) {
+            ESP_LOGE(TAG, "Invalid conformance fixture encoding: %s", vector->id);
+            return false;
+        }
+        bitchat_packet_t fixture_packet;
+        bool decoded_ok = bitchat_packet_decode(encoded, fixture_len, &fixture_packet);
+        if (decoded_ok != vector->valid) {
+            if (decoded_ok) {
+                bitchat_packet_free(&fixture_packet);
+            }
+            ESP_LOGE(TAG, "Conformance fixture disagrees: %s", vector->id);
+            return false;
+        }
+        if (decoded_ok) {
+            if (strcmp(vector->id, "packet.v1.message") == 0 &&
+                (fixture_packet.payload_len != 3 ||
+                 memcmp(fixture_packet.payload, "abc", 3) != 0)) {
+                bitchat_packet_free(&fixture_packet);
+                return false;
+            }
+            if ((strcmp(vector->id, "packet.v1.raw_deflate") == 0 ||
+                 strcmp(vector->id, "packet.v1.zlib_read") == 0) &&
+                fixture_packet.payload_len != 180) {
+                bitchat_packet_free(&fixture_packet);
+                return false;
+            }
+            bitchat_packet_free(&fixture_packet);
+        }
+    }
+    return true;
 }
 

@@ -241,16 +241,57 @@ static void dispatch_packet(uint16_t link_handle, const bitchat_packet_t *packet
 static uint64_t s_relay_seen[RELAY_CACHE_SIZE];
 static size_t s_relay_seen_next;
 
+static size_t relay_wire_len(const uint8_t *data, size_t len)
+{
+    if (!data || len < 22) {
+        return len;
+    }
+    uint8_t version = data[0];
+    uint8_t flags = data[11];
+    size_t header_len;
+    size_t payload_len;
+    if (version == 1) {
+        header_len = 22;
+        payload_len = ((size_t)data[12] << 8) | data[13];
+    } else if (version == 2 && len >= 24) {
+        header_len = 24;
+        payload_len = ((size_t)data[12] << 24) |
+                      ((size_t)data[13] << 16) |
+                      ((size_t)data[14] << 8) |
+                      data[15];
+    } else {
+        return len;
+    }
+
+    size_t wire_len = header_len;
+    if (flags & 0x01) {
+        wire_len += 8;
+    }
+    if (version == 2 && (flags & 0x08)) {
+        if (wire_len >= len) {
+            return len;
+        }
+        wire_len += 1 + (size_t)data[wire_len] * 8;
+    }
+    wire_len += payload_len;
+    if (flags & 0x02) {
+        wire_len += 64;
+    }
+    return wire_len <= len ? wire_len : len;
+}
+
 static uint64_t relay_fingerprint(const uint8_t *data, size_t len)
 {
-    /* FNV-1a over the packet bytes, skipping the TTL byte (offset 2), which
-     * changes at every hop and must not defeat deduplication. */
+    /* FNV-1a over canonical opaque packet bytes: transport padding is omitted,
+     * TTL is zeroed, and the replay-only RSR flag is cleared. */
+    size_t canonical_len = relay_wire_len(data, len);
     uint64_t hash = 1469598103934665603ULL;
-    for (size_t i = 0; i < len; ++i) {
+    for (size_t i = 0; i < canonical_len; ++i) {
         if (i == 2) {
             continue;
         }
-        hash ^= data[i];
+        uint8_t byte = i == 11 ? (data[i] & (uint8_t)~0x10) : data[i];
+        hash ^= byte;
         hash *= 1099511628211ULL;
     }
     return hash;
