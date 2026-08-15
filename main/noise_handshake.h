@@ -32,6 +32,7 @@ typedef enum {
     BITCHAT_MSG_REQUEST_SYNC = 0x21,
     BITCHAT_MSG_PREKEY_BUNDLE = 0x24,
     BITCHAT_MSG_NODE_CAPABILITY = 0x25,
+    BITCHAT_MSG_HBT_CAPABILITY = 0x2A,
     /* Bitle-private OTA types, outside the upstream range. Phones drop
      * unknown types rather than relay them, so OTA traffic moves only on
      * direct node-to-node links (see docs/OTA.md). */

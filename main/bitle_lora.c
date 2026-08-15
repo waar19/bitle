@@ -8,6 +8,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
 
@@ -89,8 +90,11 @@ static const char *TAG = "bitle_lora";
 #define ARQ_TRIES        3
 #define ARQ_MARGIN_MS    1200
 
-/* Channel access: CAD (listen-before-talk) + random backoff before TX. */
-#define TX_QUEUE_DEPTH   12
+/* Channel access: CAD (listen-before-talk) + random backoff before TX.
+ * Queue complete packets, not individual fragments. Five maximum-size batch
+ * items use less storage than the former 12-frame queue while ensuring queue
+ * admission is atomic for every fragment of a packet. */
+#define TX_BATCH_QUEUE_DEPTH 5
 #define CAD_RETRIES      5
 #define CAD_BACKOFF_MIN  30
 #define CAD_BACKOFF_SPAN 120
@@ -101,7 +105,19 @@ typedef struct {
     uint8_t data[SX1262_MAX_PAYLOAD];
 } lora_frame_t;
 
+typedef struct {
+    uint16_t len;
+    uint16_t seq;
+    uint8_t total;
+    bool want_ack;
+    uint8_t data[BITCHAT_BLE_MAX_PACKET_SIZE];
+} lora_batch_t;
+
 static QueueHandle_t s_tx_queue;
+/* Serializes capacity check, policy admission, sequence assignment, and the
+ * one atomic batch enqueue across NimBLE/noise/beacon producers. The consumer
+ * does not take this mutex; it can only create more queue capacity. */
+static SemaphoreHandle_t s_tx_admit_mutex;
 static TaskHandle_t s_task;
 static bool s_active;
 static uint16_t s_tx_seq;
@@ -310,8 +326,9 @@ static uint16_t trunk_true_len(const uint8_t *data, uint16_t len)
     return (real <= len) ? (uint16_t)real : len;
 }
 
-/* Mesh -> trunk: fragment and queue one encoded packet. Runs on the
- * caller's task (NimBLE host or noise worker); only queues. */
+/* Mesh -> trunk: atomically queue one complete encoded packet. Fragmentation
+ * happens only in lora_task after the batch has been admitted, so a full queue
+ * can never retain a prefix of a packet. */
 static int lora_link_send(uint16_t handle, const uint8_t *data, uint16_t len)
 {
     (void)handle;
@@ -320,12 +337,7 @@ static int lora_link_send(uint16_t handle, const uint8_t *data, uint16_t len)
     }
     /* Trim BLE padding before it costs LoRa airtime. */
     len = trunk_true_len(data, len);
-    /* Type-based admission + per-origin throttle + airtime governor, applied
-     * atomically to the whole packet so a packet is never partially sent. A
-     * policy decline is a handled outcome, not a transport failure (return 0
-     * so it does not read as a broken link); only a full radio queue is an
-     * actual send failure. */
-    if (!trunk_admit(data, len)) {
+    if (len < PKT_MIN_LEN) {
         return 0;
     }
     uint8_t type = data[PKT_TYPE_OFF];
@@ -335,39 +347,78 @@ static int lora_link_send(uint16_t handle, const uint8_t *data, uint16_t len)
                       type == BITCHAT_MSG_NOISE_IDENTITY_ANNOUNCE ||
                       type == BITCHAT_MSG_NODE_CAPABILITY);
     uint8_t total = (uint8_t)((len + TRUNK_CHUNK_TX - 1) / TRUNK_CHUNK_TX);
-    ESP_LOGI(TAG, "trunk TX type=0x%02X len=%u frags=%u arq=%d", type, len, total, want_ack);
-    /* Atomic across concurrent callers (NimBLE host, noise worker, lora_task
-     * beacon): a duplicated seq would collide two packets into one remote
-     * reassembly slot and corrupt both. Unique seq is sufficient — the
-     * receiver keys slots on (src,seq), so interleaved fragments still sort. */
-    taskENTER_CRITICAL(&s_gov_mux);
-    uint16_t seq = ++s_tx_seq;
-    taskEXIT_CRITICAL(&s_gov_mux);
-
-    for (uint8_t idx = 0; idx < total; ++idx) {
-        lora_frame_t frame;
-        uint16_t off = (uint16_t)idx * TRUNK_CHUNK_TX;
-        uint16_t chunk = len - off < TRUNK_CHUNK_TX ? len - off : TRUNK_CHUNK_TX;
-        uint8_t *h = frame.data;
-        h[0] = TRUNK_MAGIC0;
-        h[1] = TRUNK_MAGIC1;
-        h[2] = TRUNK_VERSION;
-        h[3] = want_ack ? FTYPE_ACK_REQ : 0x00;
-        memcpy(h + 4, s_src_tag, 4);
-        memset(h + 8, 0, 4);           /* dst: broadcast */
-        h[12] = seq >> 8;
-        h[13] = seq & 0xFF;
-        h[14] = idx;
-        h[15] = total;
-        memcpy(h + TRUNK_HDR_LEN, data + off, chunk);
-        frame.len = TRUNK_HDR_LEN + chunk;
-        frame.want_ack = want_ack;
-        if (xQueueSend(s_tx_queue, &frame, 0) != pdTRUE) {
-            ESP_LOGW(TAG, "TX queue full; dropping packet seq=%u", seq);
-            return -1;
-        }
+    if (total == 0 || total > TRUNK_MAX_FRAGS) {
+        ESP_LOGE(TAG, "invalid TX fragment count=%u len=%u", total, len);
+        return -1;
     }
+
+    /* A batch is a single queue item, so xQueueSend either copies the whole
+     * packet or none of it. The mutex keeps another producer from consuming
+     * the checked slot before enqueue; the radio task can only free slots. */
+    if (xSemaphoreTake(s_tx_admit_mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "TX admission mutex unavailable");
+        return -1;
+    }
+    if (uxQueueSpacesAvailable(s_tx_queue) == 0) {
+        xSemaphoreGive(s_tx_admit_mutex);
+        ESP_LOGW(TAG, "TX batch queue full; rejecting packet len=%u frags=%u", len, total);
+        return -1;
+    }
+    /* Apply throttle/governor only after reservable capacity is known, so a
+     * queue-full rejection does not consume airtime credit or throttle time. */
+    if (!trunk_admit(data, len)) {
+        xSemaphoreGive(s_tx_admit_mutex);
+        return 0;
+    }
+
+    lora_batch_t batch = {
+        .len = len,
+        .seq = ++s_tx_seq,
+        .total = total,
+        .want_ack = want_ack,
+    };
+    memcpy(batch.data, data, len);
+    if (xQueueSend(s_tx_queue, &batch, 0) != pdTRUE) {
+        /* No rollback is needed: a batch is one indivisible queue item. This
+         * can only indicate queue corruption/deletion because capacity and
+         * enqueue are serialized against every producer. */
+        xSemaphoreGive(s_tx_admit_mutex);
+        ESP_LOGE(TAG, "TX batch enqueue failed unexpectedly seq=%u", batch.seq);
+        return -1;
+    }
+    xSemaphoreGive(s_tx_admit_mutex);
+
+    ESP_LOGI(TAG, "trunk TX type=0x%02X len=%u frags=%u arq=%d seq=%u",
+             type, len, total, want_ack, batch.seq);
     return 0;
+}
+
+static bool batch_next_frame(const lora_batch_t *batch, uint8_t *next_idx,
+                             lora_frame_t *frame)
+{
+    if (*next_idx >= batch->total) {
+        return false;
+    }
+    uint8_t idx = *next_idx;
+    uint16_t off = (uint16_t)idx * TRUNK_CHUNK_TX;
+    uint16_t remaining = batch->len - off;
+    uint16_t chunk = remaining < TRUNK_CHUNK_TX ? remaining : TRUNK_CHUNK_TX;
+    uint8_t *h = frame->data;
+    h[0] = TRUNK_MAGIC0;
+    h[1] = TRUNK_MAGIC1;
+    h[2] = TRUNK_VERSION;
+    h[3] = batch->want_ack ? FTYPE_ACK_REQ : 0x00;
+    memcpy(h + 4, s_src_tag, 4);
+    memset(h + 8, 0, 4);           /* dst: broadcast */
+    h[12] = batch->seq >> 8;
+    h[13] = batch->seq & 0xFF;
+    h[14] = idx;
+    h[15] = batch->total;
+    memcpy(h + TRUNK_HDR_LEN, batch->data + off, chunk);
+    frame->len = TRUNK_HDR_LEN + chunk;
+    frame->want_ack = batch->want_ack;
+    (*next_idx)++;
+    return true;
 }
 
 /* Acks bypass the data queue entirely. When both ends have ARQ frames in
@@ -524,6 +575,9 @@ static void rx_frame(const uint8_t *f, uint16_t len, int16_t rssi, int8_t snr)
 static void lora_task(void *arg)
 {
     (void)arg;
+    lora_batch_t batch;
+    bool have_batch = false;
+    uint8_t batch_next_idx = 0;
     lora_frame_t pending;
     bool have_pending = false;
     int cad_tries = 0;
@@ -597,6 +651,7 @@ static void lora_task(void *arg)
                         arq_sends++;
                     } else {
                         have_pending = false;
+                        have_batch = false;
                         sx1262_resume_rx();
                     }
                 }
@@ -610,14 +665,17 @@ static void lora_task(void *arg)
                         awaiting_cad = true;
                     }
                 } else {
-                    /* channel persistently busy: drop the frame */
+                    /* A missing fragment makes the rest useless; drop the
+                     * unsent suffix of this batch as one packet failure. */
                     have_pending = false;
+                    have_batch = false;
                     sx1262_resume_rx();
                 }
                 break;
             case SX1262_EVT_TIMEOUT:
                 awaiting_tx_done = false;
                 have_pending = false;
+                have_batch = false;
                 awaiting_ack = false;
                 sx1262_resume_rx();
                 break;
@@ -657,11 +715,13 @@ static void lora_task(void *arg)
                         awaiting_cad = true;   /* retransmit */
                     } else {
                         have_pending = false;
+                        have_batch = false;
                     }
                 } else {
                     ESP_LOGW(TAG, "trunk frame lost after %d sends seq=%u idx=%u",
                              ARQ_TRIES, pseq, pidx);
                     have_pending = false;
+                    have_batch = false;
                 }
             }
         }
@@ -676,19 +736,29 @@ static void lora_task(void *arg)
                 awaiting_cad = true;
             } else {
                 have_pending = false;
+                have_batch = false;
             }
         }
 
-        if (!have_pending && !awaiting_tx_done && !awaiting_cad && !awaiting_ack &&
-            xQueueReceive(s_tx_queue, &pending, 0) == pdTRUE) {
-            have_pending = true;
-            cad_tries = 0;
-            arq_sends = 0;
-            s_ack_seen = false;
-            if (sx1262_start_cad() == ESP_OK) {
-                awaiting_cad = true;
-            } else {
-                have_pending = false;
+        if (!have_pending && !awaiting_tx_done && !awaiting_cad && !awaiting_ack) {
+            if (have_batch && batch_next_idx >= batch.total) {
+                have_batch = false;
+            }
+            if (!have_batch && xQueueReceive(s_tx_queue, &batch, 0) == pdTRUE) {
+                have_batch = true;
+                batch_next_idx = 0;
+            }
+            if (have_batch && batch_next_frame(&batch, &batch_next_idx, &pending)) {
+                have_pending = true;
+                cad_tries = 0;
+                arq_sends = 0;
+                s_ack_seen = false;
+                if (sx1262_start_cad() == ESP_OK) {
+                    awaiting_cad = true;
+                } else {
+                    have_pending = false;
+                    have_batch = false;
+                }
             }
         }
     }
@@ -762,8 +832,14 @@ esp_err_t bitle_lora_init(void)
     s_gov_credit_ms = GOV_BURST_MS;
     s_gov_last_ms = esp_timer_get_time() / 1000ULL;
 
-    s_tx_queue = xQueueCreate(TX_QUEUE_DEPTH, sizeof(lora_frame_t));
+    s_tx_admit_mutex = xSemaphoreCreateMutex();
+    if (!s_tx_admit_mutex) {
+        return ESP_ERR_NO_MEM;
+    }
+    s_tx_queue = xQueueCreate(TX_BATCH_QUEUE_DEPTH, sizeof(lora_batch_t));
     if (!s_tx_queue) {
+        vSemaphoreDelete(s_tx_admit_mutex);
+        s_tx_admit_mutex = NULL;
         return ESP_ERR_NO_MEM;
     }
     if (xTaskCreate(lora_task, "bitle_lora", 6144, NULL, tskIDLE_PRIORITY + 4, &s_task) != pdTRUE) {
