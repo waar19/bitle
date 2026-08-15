@@ -1,0 +1,17 @@
+---
+description: After finishing work, always commit and push without waiting to be asked
+alwaysApply: true
+---
+
+# Git: always commit and push
+
+When the requested work is done and there are pending changes:
+
+1. Create a commit. Do not wait for the user to say "commit".
+2. Push to the current branch remote (usually `main`). Do not wait for the user to say "push".
+3. This repo is the firmware used by HearthBit at `firmware/anchor-node`. After pushing here, update that app repo's submodule pointer, then commit and push the app repo too. Skipping the app update leaves the phones on old firmware.
+4. Use a short, non-technical commit message focused on user-facing impact.
+5. Do not force-push. Do not skip hooks. Do not commit secrets (`.env`, credentials, keys, `*bitle_owner_key*`).
+6. The Source Control panel being open is not a substitute for this: still commit and push from the agent.
+
+This project rule overrides any generic "only commit/push when asked" guidance for this repository.
