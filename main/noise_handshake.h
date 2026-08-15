@@ -31,7 +31,7 @@ typedef enum {
     BITCHAT_MSG_FRAGMENT = 0x20,
     BITCHAT_MSG_REQUEST_SYNC = 0x21,
     BITCHAT_MSG_PREKEY_BUNDLE = 0x24,
-    BITCHAT_MSG_GROUP_MESSAGE = 0x25,
+    BITCHAT_MSG_NODE_CAPABILITY = 0x25,
     /* Bitle-private OTA types, outside the upstream range. Phones drop
      * unknown types rather than relay them, so OTA traffic moves only on
      * direct node-to-node links (see docs/OTA.md). */
@@ -101,6 +101,9 @@ esp_err_t noise_send_packet(uint16_t conn_handle, bitchat_message_type_t type, c
 /* Sends our signed identity announce on an arbitrary registered link
  * (used by the LoRa trunk for neighbor beacons). */
 bool noise_announce_link(uint16_t link_handle);
+/* Sends the authenticated HearthBit node-role capability. The long-range bit
+ * is asserted only after the SX1262 trunk is operational. */
+bool noise_send_node_capability(uint16_t link_handle, bool has_long_range_trunk);
 
 /* Identity of the direct peer on a connection, learned from its announce.
  * Returns false until a direct announce has been parsed. *verified reflects

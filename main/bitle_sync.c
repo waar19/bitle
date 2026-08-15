@@ -247,10 +247,18 @@ static bool sorted_contains(const uint64_t *values, size_t count, uint64_t needl
 
 /* --- Store ----------------------------------------------------------------*/
 
+static bool is_announce_type(uint8_t type)
+{
+    return type == BITCHAT_MSG_ANNOUNCE ||
+           type == BITCHAT_MSG_NODE_CAPABILITY;
+}
+
 static uint64_t type_window_ms(uint8_t type)
 {
     switch (type) {
-    case BITCHAT_MSG_ANNOUNCE: return WINDOW_ANNOUNCE_MS;
+    case BITCHAT_MSG_ANNOUNCE:
+    case BITCHAT_MSG_NODE_CAPABILITY:
+        return WINDOW_ANNOUNCE_MS;
     case BITCHAT_MSG_PREKEY_BUNDLE: return WINDOW_PREKEY_MS;
     default: return WINDOW_MESSAGE_MS;
     }
@@ -269,7 +277,7 @@ static size_t type_count(uint8_t announce, uint8_t prekey)
         if (!s_slots[i].in_use) {
             continue;
         }
-        bool is_announce = s_slots[i].type == BITCHAT_MSG_ANNOUNCE;
+        bool is_announce = is_announce_type(s_slots[i].type);
         bool is_prekey = s_slots[i].type == BITCHAT_MSG_PREKEY_BUNDLE;
         if ((announce && is_announce) || (prekey && is_prekey) ||
             (!announce && !prekey && !is_announce && !is_prekey)) {
@@ -295,8 +303,10 @@ static sync_slot_t *evict_for(uint8_t type, uint64_t now_ms)
     for (size_t i = 0; i < BITLE_SYNC_SLOTS; ++i) {
         sync_slot_t *s = &s_slots[i];
         bool same_class = (s->type == type) ||
-                          (type != BITCHAT_MSG_ANNOUNCE && type != BITCHAT_MSG_PREKEY_BUNDLE &&
-                           s->type != BITCHAT_MSG_ANNOUNCE && s->type != BITCHAT_MSG_PREKEY_BUNDLE);
+                          (!is_announce_type(type) &&
+                           type != BITCHAT_MSG_PREKEY_BUNDLE &&
+                           !is_announce_type(s->type) &&
+                           s->type != BITCHAT_MSG_PREKEY_BUNDLE);
         if (!same_class) {
             continue;
         }
@@ -315,7 +325,7 @@ static sync_slot_t *evict_for(uint8_t type, uint64_t now_ms)
  * bundles keyed by the bundle's inner noise key (TLV 0x01) -> 8-byte ID. */
 static bool derive_owner(const bitchat_packet_t *packet, uint8_t owner[8])
 {
-    if (packet->type == BITCHAT_MSG_ANNOUNCE) {
+    if (is_announce_type(packet->type)) {
         memcpy(owner, packet->sender_id, 8);
         return true;
     }
@@ -351,7 +361,7 @@ void bitle_sync_ingest(const bitchat_packet_t *packet, const uint8_t *raw, uint1
     }
     uint8_t type = packet->type;
     if (type != BITCHAT_MSG_ANNOUNCE && type != BITCHAT_MSG_MESSAGE &&
-        type != BITCHAT_MSG_GROUP_MESSAGE && type != BITCHAT_MSG_PREKEY_BUNDLE) {
+        type != BITCHAT_MSG_NODE_CAPABILITY && type != BITCHAT_MSG_PREKEY_BUNDLE) {
         return;
     }
     /* Only signed packets are worth carrying: receivers verify signatures
@@ -388,7 +398,7 @@ void bitle_sync_ingest(const bitchat_packet_t *packet, const uint8_t *raw, uint1
             return; /* already stored */
         }
         /* Replace semantics for announce/prekey: newest per owner wins. */
-        if ((type == BITCHAT_MSG_ANNOUNCE || type == BITCHAT_MSG_PREKEY_BUNDLE) &&
+        if ((is_announce_type(type) || type == BITCHAT_MSG_PREKEY_BUNDLE) &&
             s->type == type && memcmp(s->owner, owner, 8) == 0) {
             if (packet->timestamp_ms <= s->timestamp_ms) {
                 xSemaphoreGive(s_lock);
@@ -401,7 +411,7 @@ void bitle_sync_ingest(const bitchat_packet_t *packet, const uint8_t *raw, uint1
     if (!target) {
         size_t quota;
         size_t used;
-        if (type == BITCHAT_MSG_ANNOUNCE) {
+        if (is_announce_type(type)) {
             quota = BITLE_SYNC_QUOTA_ANNOUNCE;
             used = type_count(1, 0);
         } else if (type == BITCHAT_MSG_PREKEY_BUNDLE) {
@@ -530,7 +540,7 @@ static bool type_requested(uint8_t type, uint64_t flags)
     switch (type) {
     case BITCHAT_MSG_ANNOUNCE: return (flags & FLAG_ANNOUNCE) != 0;
     case BITCHAT_MSG_MESSAGE: return (flags & FLAG_MESSAGE) != 0;
-    case BITCHAT_MSG_GROUP_MESSAGE: return (flags & FLAG_GROUP) != 0;
+    case BITCHAT_MSG_NODE_CAPABILITY: return (flags & FLAG_ANNOUNCE) != 0;
     case BITCHAT_MSG_PREKEY_BUNDLE: return (flags & FLAG_PREKEY) != 0;
     default: return false;
     }

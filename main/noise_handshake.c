@@ -17,6 +17,7 @@
 #include "bitchat_ble.h"
 #include "bitchat_time.h"
 #include "bitle_courier.h"
+#include "bitle_lora.h"
 #include "bitle_ota.h"
 #include "bitle_sync.h"
 #include "nickname_manager.h"
@@ -48,6 +49,10 @@
 #define NOISE_PACKET_TTL          7
 #define NOISE_MAX_ENCRYPTED_PAYLOAD 320
 #define ANNOUNCE_INTERVAL_MS      (10 * 1000ULL)
+#define NODE_CAPABILITY_VERSION   0x01
+#define NODE_ROLE_INFRA_RELAY     0x03
+#define NODE_FLAG_RELAY           0x01
+#define NODE_FLAG_LONG_RANGE      0x10
 
 #define BITLE_AUTO_REPLY_TEXT \
     "This is an automated reply. Bitle is a relay node that extends the " \
@@ -813,6 +818,24 @@ bool noise_announce_link(uint16_t link_handle)
     return bitle_link_send(link_handle, buffer, (uint16_t)encoded_len) == ESP_OK;
 }
 
+bool noise_send_node_capability(uint16_t link_handle, bool has_long_range_trunk)
+{
+    uint8_t payload[] = {
+        NODE_CAPABILITY_VERSION,
+        NODE_ROLE_INFRA_RELAY,
+        NODE_FLAG_RELAY | (has_long_range_trunk ? NODE_FLAG_LONG_RANGE : 0),
+    };
+    return noise_send_packet(
+        link_handle,
+        BITCHAT_MSG_NODE_CAPABILITY,
+        NULL,
+        payload,
+        sizeof(payload),
+        NOISE_PACKET_TTL,
+        true
+    ) == ESP_OK;
+}
+
 static bool send_announce(noise_session_t *session)
 {
     if (!session) {
@@ -852,6 +875,10 @@ static bool send_announce(noise_session_t *session)
     }
 
     if (bitle_link_send(session->conn_handle, buffer, (uint16_t)encoded_len) != ESP_OK) {
+        return false;
+    }
+    if (!noise_send_node_capability(session->conn_handle, bitle_lora_active())) {
+        ESP_LOGW(TAG, "Failed to send NODE_CAPABILITY conn=%u", session->conn_handle);
         return false;
     }
 

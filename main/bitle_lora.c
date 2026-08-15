@@ -188,7 +188,15 @@ static bool trunk_admit(const uint8_t *data, uint16_t len)
     }
     uint8_t type = data[PKT_TYPE_OFF];
     bool ota = (type >= 0xA0 && type <= 0xA3);
-    bool announce = (type == BITCHAT_MSG_ANNOUNCE || type == BITCHAT_MSG_NOISE_IDENTITY_ANNOUNCE);
+    bool announce = (
+        type == BITCHAT_MSG_ANNOUNCE ||
+        type == BITCHAT_MSG_NOISE_IDENTITY_ANNOUNCE ||
+        type == BITCHAT_MSG_NODE_CAPABILITY
+    );
+    bool identity_announce = (
+        type == BITCHAT_MSG_ANNOUNCE ||
+        type == BITCHAT_MSG_NOISE_IDENTITY_ANNOUNCE
+    );
     /* Message-class traffic is user-driven, rare, and time-critical: a Noise
      * handshake, DM, courier envelope, or receipt must never be dropped for
      * airtime budget. Only the automatic, periodic announce/beacon traffic is
@@ -240,7 +248,7 @@ static bool trunk_admit(const uint8_t *data, uint16_t len)
             ESP_LOGD(TAG, "airtime budget low; deferring announce");
             return false;
         }
-        if (announce_throttled(data + PKT_SENDER_OFF, now)) {
+        if (identity_announce && announce_throttled(data + PKT_SENDER_OFF, now)) {
             taskEXIT_CRITICAL(&s_gov_mux);
             return false;
         }
@@ -324,7 +332,8 @@ static int lora_link_send(uint16_t handle, const uint8_t *data, uint16_t len)
     /* Announces are periodic broadcast discovery; everything else (DMs,
      * handshakes, courier, acks-of-messages) gets per-frame ARQ. */
     bool want_ack = !(type == BITCHAT_MSG_ANNOUNCE ||
-                      type == BITCHAT_MSG_NOISE_IDENTITY_ANNOUNCE);
+                      type == BITCHAT_MSG_NOISE_IDENTITY_ANNOUNCE ||
+                      type == BITCHAT_MSG_NODE_CAPABILITY);
     uint8_t total = (uint8_t)((len + TRUNK_CHUNK_TX - 1) / TRUNK_CHUNK_TX);
     ESP_LOGI(TAG, "trunk TX type=0x%02X len=%u frags=%u arq=%d", type, len, total, want_ack);
     /* Atomic across concurrent callers (NimBLE host, noise worker, lora_task
@@ -533,7 +542,11 @@ static void lora_task(void *arg)
         if (now >= next_beacon_ms) {
             next_beacon_ms = now + BEACON_INTERVAL_MS;
             if (noise_announce_link(BITLE_LORA_LINK_HANDLE)) {
-                ESP_LOGI(TAG, "trunk beacon sent");
+                if (noise_send_node_capability(BITLE_LORA_LINK_HANDLE, true)) {
+                    ESP_LOGI(TAG, "trunk beacon sent with LONG_RANGE_TRUNK");
+                } else {
+                    ESP_LOGW(TAG, "trunk capability beacon failed");
+                }
             }
         }
 
