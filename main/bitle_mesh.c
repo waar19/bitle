@@ -10,6 +10,7 @@
 #include "bitchat_ble.h"
 #include "bitchat_time.h"
 #include "bitle_link.h"
+#include "bitle_metrics.h"
 #include "bitle_ota.h"
 #include "bitle_sync.h"
 #include "noise_handshake.h"
@@ -125,6 +126,7 @@ static void handle_fragment(uint16_t link_handle, const bitchat_packet_t *packet
 
     bitchat_packet_t inner;
     if (!bitchat_packet_decode(reassembled, reassembled_len, &inner)) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         ESP_LOGW(TAG, "Failed to decode reassembled packet (%u bytes)", (unsigned)reassembled_len);
         return;
     }
@@ -133,6 +135,7 @@ static void handle_fragment(uint16_t link_handle, const bitchat_packet_t *packet
      * fragment frames differ, but the inner packet is byte-identical —
      * this is where a duplicate handshake sneaks back in. */
     if (relay_seen_before(relay_fingerprint(reassembled, reassembled_len))) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_DEDUPLICATED);
         ESP_LOGD(TAG, "duplicate reassembled packet dropped (type=0x%02X)", inner.type);
         bitchat_packet_free(&inner);
         return;
@@ -295,6 +298,8 @@ static void relay_packet(uint16_t src_link, uint8_t *buffer, uint16_t len, const
 
     int forwarded = bitle_link_broadcast(src_link, buffer, len);
     if (forwarded > 0) {
+        /* Count the relay decision once per packet, not once per output link. */
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_FORWARDED);
         ESP_LOGI(TAG, "Relayed type=0x%02X ttl=%u to %d link(s)", packet->type, buffer[2], forwarded);
     }
 }
@@ -307,8 +312,11 @@ esp_err_t bitle_mesh_init(void)
 
 bool bitle_mesh_inbound(uint16_t link_handle, uint8_t *buffer, uint16_t len)
 {
+    /* One complete transport frame entered the mesh, before any decode. */
+    bitle_metrics_increment(BITLE_METRIC_PACKETS_RECEIVED);
     bitchat_packet_t packet;
     if (!bitchat_packet_decode(buffer, len, &packet)) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         ESP_LOGW(TAG, "Failed to decode inbound packet len=%u", len);
         return false;
     }
@@ -320,6 +328,7 @@ bool bitle_mesh_inbound(uint16_t link_handle, uint8_t *buffer, uint16_t len)
      * link, and every reply then exits the wrong interface. Retries are
      * never byte-identical (fresh timestamps/nonces), so they pass. */
     if (relay_seen_before(relay_fingerprint(buffer, len))) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_DEDUPLICATED);
         xSemaphoreGive(s_lock);
         ESP_LOGD(TAG, "duplicate packet dropped (type=0x%02X)", packet.type);
         bitchat_packet_free(&packet);

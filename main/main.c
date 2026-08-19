@@ -12,6 +12,7 @@
 #include "bitle_link.h"
 #include "bitle_lora.h"
 #include "bitle_mesh.h"
+#include "bitle_metrics.h"
 #include "bitle_ota.h"
 #include "bitle_sync.h"
 #include "noise_handshake.h"
@@ -26,6 +27,7 @@ static void bitle_main_task(void *arg)
     ESP_LOGI(TAG, "Bitle task running");
 
     uint64_t last_heap_log_ms = 0;
+    bool first_health_log = true;
     while (true) {
 #ifndef BITLE_TEST_NO_BLE
         bitchat_ble_poll();
@@ -39,6 +41,11 @@ static void bitle_main_task(void *arg)
             ESP_LOGI(TAG, "Heap free=%lu min=%lu",
                      (unsigned long)esp_get_free_heap_size(),
                      (unsigned long)esp_get_minimum_free_heap_size());
+            if (first_health_log) {
+                first_health_log = false;
+            } else {
+                bitle_metrics_log();
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
@@ -52,6 +59,11 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    ESP_ERROR_CHECK(bitle_metrics_init());
+    if (!bitle_metrics_self_test()) {
+        ESP_LOGE(TAG, "Metrics self-test failed");
+        abort();
+    }
 
     ESP_LOGI(TAG, "Starting Bitle firmware");
 
@@ -65,6 +77,11 @@ void app_main(void)
     ESP_ERROR_CHECK(bitle_sync_init());
     if (bitle_courier_init() != ESP_OK) {
         ESP_LOGW(TAG, "Courier mailbox unavailable; continuing without it");
+    }
+    bitle_metrics_log();
+    if (!noise_node_capability_self_test()) {
+        ESP_LOGE(TAG, "Node capability self-test failed");
+        abort();
     }
     if (!packet_codec_self_test()) {
         ESP_LOGE(TAG, "Packet codec self-test failed");

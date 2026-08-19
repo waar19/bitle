@@ -49,6 +49,10 @@ Radio: **Semtech SX1262** (Seeed Wio-SX1262 + XIAO ESP32-S3), +22 dBm, 902–928
 
 `app_main()` runs a fixed init order: NVS → PSA crypto (with SHA-256/HMAC known-answer self-tests) → time → Noise → OTA → sync → courier → packet codec (with self-test) → link registry → mesh core → LoRa (radio-optional) → BLE init → BLE start, then spawns a single `bitle_main` FreeRTOS task that polls BLE, Noise, and the clock every 50 ms. Most init steps are fatal on failure (`ESP_ERROR_CHECK` / `abort`); the courier mailbox is the one optional subsystem — if it can't start, the node logs a warning and continues without store-and-forward. If NVS reports a layout/version change, the flash is erased and re-initialized rather than bricking boot.
 
+## Serial metrics
+
+The node emits one stable `HBIT_METRICS key=value ...` line during boot and about every 10 minutes. Read it with `idf.py monitor` and filter for `HBIT_METRICS`. Counters are aggregate and saturating: `received` counts complete frames before decode; `forwarded` counts one successful relay decision per packet (not each output link); `stored` excludes idempotent re-deposits; `delivered` counts every successful outgoing courier-envelope handoff, whether direct to its owner, routed toward an owner, or sprayed to a carrier; and `deduplicated` covers mesh drops plus courier re-deposits. `expired` combines envelopes rejected as already expired with stored records discarded by expiry, while `rejected` covers permanent decode, authentication, and courier-policy drops and excludes deduplication and expiry. Uptime and `last_activity_uptime_ms` are monotonic since boot, and no sender IDs, message content, tags, or coordinates are logged. When the optional mailbox is unavailable, `mailbox_available=false` and both courier-store size fields are zero.
+
 ## Repository layout
 
 ```

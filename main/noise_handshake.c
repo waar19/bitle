@@ -18,6 +18,7 @@
 #include "bitchat_time.h"
 #include "bitle_courier.h"
 #include "bitle_lora.h"
+#include "bitle_metrics.h"
 #include "bitle_ota.h"
 #include "bitle_sync.h"
 #include "nickname_manager.h"
@@ -51,7 +52,9 @@
 #define ANNOUNCE_INTERVAL_MS      (10 * 1000ULL)
 #define NODE_CAPABILITY_VERSION   0x01
 #define NODE_ROLE_INFRA_RELAY     0x03
+#define NODE_ROLE_INFRA_DATA_ANCHOR 0x04
 #define NODE_FLAG_RELAY           0x01
+#define NODE_FLAG_STORE           0x04
 #define NODE_FLAG_LONG_RANGE      0x10
 
 #define BITLE_AUTO_REPLY_TEXT \
@@ -818,13 +821,54 @@ bool noise_announce_link(uint16_t link_handle)
     return bitle_link_send(link_handle, buffer, (uint16_t)encoded_len) == ESP_OK;
 }
 
+void noise_build_node_capability_payload(bool mailbox_available,
+                                         bool has_long_range_trunk,
+                                         uint8_t payload[3])
+{
+    payload[0] = NODE_CAPABILITY_VERSION;
+    payload[1] = mailbox_available
+        ? NODE_ROLE_INFRA_DATA_ANCHOR
+        : NODE_ROLE_INFRA_RELAY;
+    payload[2] = NODE_FLAG_RELAY
+        | (mailbox_available ? NODE_FLAG_STORE : 0)
+        | (has_long_range_trunk ? NODE_FLAG_LONG_RANGE : 0);
+}
+
+bool noise_node_capability_self_test(void)
+{
+    static const struct {
+        bool mailbox_available;
+        bool has_long_range_trunk;
+        uint8_t expected[3];
+    } cases[] = {
+        {false, false, {0x01, 0x03, 0x01}},
+        {false, true,  {0x01, 0x03, 0x11}},
+        {true,  false, {0x01, 0x04, 0x05}},
+        {true,  true,  {0x01, 0x04, 0x15}},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        uint8_t payload[3];
+        noise_build_node_capability_payload(
+            cases[i].mailbox_available,
+            cases[i].has_long_range_trunk,
+            payload
+        );
+        if (memcmp(payload, cases[i].expected, sizeof(payload)) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool noise_send_node_capability(uint16_t link_handle, bool has_long_range_trunk)
 {
-    uint8_t payload[] = {
-        NODE_CAPABILITY_VERSION,
-        NODE_ROLE_INFRA_RELAY,
-        NODE_FLAG_RELAY | (has_long_range_trunk ? NODE_FLAG_LONG_RANGE : 0),
-    };
+    uint8_t payload[3];
+    noise_build_node_capability_payload(
+        bitle_courier_is_available(),
+        has_long_range_trunk,
+        payload
+    );
     return noise_send_packet(
         link_handle,
         BITCHAT_MSG_NODE_CAPABILITY,
@@ -1303,6 +1347,7 @@ static bool enqueue_packet_event(noise_evt_type_t type, uint16_t conn_handle, co
         return false;
     }
     if (packet->payload_len > NOISE_EVENT_PAYLOAD_MAX) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         ESP_LOGW(TAG, "Dropping type=0x%02X payload too large (%u)", packet->type, packet->payload_len);
         return false;
     }
@@ -1473,6 +1518,7 @@ static void process_announce_event(const noise_event_t *evt)
     if (parse_announce_tlv(evt->payload, evt->payload_len, &ident)) {
         bool sig_ok = false;
         if (!verify_announce_event(evt, &ident, &sig_ok)) {
+            bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
             ESP_LOGW(TAG, "conn=%u ANNOUNCE sender not derived from announced key; dropping", conn_handle);
             return;
         }
@@ -1543,6 +1589,7 @@ static void process_announce_event(const noise_event_t *evt)
         ESP_LOGI(TAG, "conn=%u peer '%s' announced (%s%s)", conn_handle, ident.nickname,
                  sig_ok ? "verified" : "unverified", is_direct ? "" : ", relayed");
     } else {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         ESP_LOGW(TAG, "conn=%u ANNOUNCE TLV parse failed", conn_handle);
     }
 
@@ -1601,6 +1648,7 @@ static void process_encrypted_event(const noise_event_t *evt)
     uint8_t plaintext[NOISE_MAX_ENCRYPTED_PAYLOAD];
     size_t plaintext_len = sizeof(plaintext);
     if (!decrypt_payload(session, evt->payload, evt->payload_len, plaintext, &plaintext_len)) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         ESP_LOGW(TAG, "Decrypt failed for conn=%u", evt->conn_handle);
         return;
     }
@@ -1633,21 +1681,25 @@ static void process_courier_event(const noise_event_t *evt)
 {
     noise_session_t *session = find_session(evt->conn_handle);
     if (!session) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         return;
     }
     /* Deposits must arrive on the direct link from their claimed sender. */
     if (memcmp(session->peer_id, evt->peer_id, sizeof(session->peer_id)) != 0) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         ESP_LOGI(TAG, "conn=%u courier packet from non-link sender; ignoring", evt->conn_handle);
         return;
     }
     size_t idx = session - s_sessions;
     if (idx >= NOISE_MAX_SESSIONS || !s_identities[idx].valid || !s_identities[idx].verified) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         ESP_LOGW(TAG, "conn=%u courier deposit without verified identity", evt->conn_handle);
         return;
     }
     bitchat_packet_t pkt;
     event_to_packet(evt, BITCHAT_MSG_COURIER_ENVELOPE, &pkt);
     if (!noise_verify_packet_signature(&pkt, s_identities[idx].sign_key)) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         ESP_LOGW(TAG, "conn=%u courier deposit signature invalid", evt->conn_handle);
         return;
     }

@@ -9,6 +9,7 @@
 #include "freertos/semphr.h"
 
 #include "bitchat_time.h"
+#include "bitle_metrics.h"
 
 #define STORE_SECTOR_SIZE     4096
 #define STORE_RECORD_MAGIC    0xB17E
@@ -99,7 +100,7 @@ static int index_find(const uint8_t key[BITLE_STORE_KEY_LEN])
     return -1;
 }
 
-static void tombstone_at(uint32_t record_off)
+static bool tombstone_at(uint32_t record_off)
 {
     uint8_t dead = 0x00;
     if (esp_partition_write(s_part, record_off + STORE_ALIVE_OFFSET, &dead, 1) != ESP_OK) {
@@ -107,7 +108,9 @@ static void tombstone_at(uint32_t record_off)
          * rebuild dedups by key (newest wins) so it cannot resurrect a
          * superseded copy, but log it as a flash-health signal. */
         ESP_LOGW(TAG, "tombstone write failed @0x%lx", (unsigned long)record_off);
+        return false;
     }
+    return true;
 }
 
 /* Erases the oldest sector (lowest seq) and drops its records from the
@@ -269,6 +272,7 @@ void bitle_store_iterate(bitle_store_iter_cb cb, void *arg)
         if (entry->expiry_unix_s && now > entry->expiry_unix_s) {
             tombstone_at(entry->offset);
             index_remove_at(i);
+            bitle_metrics_increment(BITLE_METRIC_PACKETS_EXPIRED);
             continue;
         }
         store_record_hdr_t hdr;
@@ -315,7 +319,13 @@ bool bitle_store_contains(const uint8_t key[BITLE_STORE_KEY_LEN])
 
 size_t bitle_store_count(void)
 {
-    return s_index_count;
+    if (!s_part || !s_lock) {
+        return 0;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    size_t count = s_index_count;
+    xSemaphoreGive(s_lock);
+    return count;
 }
 
 esp_err_t bitle_store_init(void)
@@ -360,6 +370,13 @@ esp_err_t bitle_store_init(void)
                 break;
             }
             bool expired = hdr.expiry_unix_s && now > hdr.expiry_unix_s;
+            if (hdr.alive == 0xFF && expired) {
+                /* Persist the boot-time discard before counting it. A failed
+                 * flash write stays alive and is retried on the next boot. */
+                if (tombstone_at(off)) {
+                    bitle_metrics_increment(BITLE_METRIC_PACKETS_EXPIRED);
+                }
+            }
             if (hdr.alive == 0xFF && !expired && s_index_count < BITLE_STORE_MAX_RECORDS) {
                 /* Dedup by key: a refreshed put whose tombstone write failed
                  * can leave two live copies. Keep the one in the newest

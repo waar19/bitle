@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "bitle_hash.h"
+#include "bitle_metrics.h"
 
 #include "bitchat_ble.h"
 #include "bitchat_time.h"
@@ -549,11 +550,13 @@ static bool type_requested(uint8_t type, uint64_t flags)
 void bitle_sync_handle_request(uint16_t conn_handle, const bitchat_packet_t *packet)
 {
     if (packet->ttl != 0) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         return; /* upstream requirement: requestSync is link-local, ttl 0 */
     }
     uint8_t sign_key[32];
     bool verified = false;
     if (!noise_get_peer_identity(conn_handle, NULL, sign_key, &verified) || !verified) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         return;
     }
 
@@ -567,17 +570,20 @@ void bitle_sync_handle_request(uint16_t conn_handle, const bitchat_packet_t *pac
         peer->count = 0;
     }
     if (peer->count >= RATE_MAX_RESPONSES) {
+        /* Temporary rate limiting is not a permanent packet rejection. */
         return;
     }
     peer->count++;
 
     if (!noise_verify_packet_signature(packet, sign_key)) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         ESP_LOGW(TAG, "conn=%u requestSync signature invalid", conn_handle);
         return;
     }
 
     sync_request_t req;
     if (!parse_request(packet->payload, packet->payload_len, &req)) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         return;
     }
 

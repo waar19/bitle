@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include "bitle_hash.h"
 
+#include "bitle_metrics.h"
 #include "bitle_store.h"
 #include "noise_handshake.h"
 
@@ -38,6 +39,7 @@ typedef struct {
 } side_state_t;
 
 static side_state_t s_side[BITLE_COURIER_MAX_ENVELOPES];
+static bool s_available;
 
 /* Stored payload framing inside bitle_store: [depositor 8B][envelope TLVs].
  * The store's flags byte carries the remaining copy count. */
@@ -265,8 +267,14 @@ static bool send_envelope(uint16_t conn_handle, const uint8_t recipient[8],
     if (!len) {
         return false;
     }
-    return noise_send_packet(conn_handle, BITCHAT_MSG_COURIER_ENVELOPE,
-                             recipient, payload, len, 7, true) == ESP_OK;
+    bool sent = noise_send_packet(conn_handle, BITCHAT_MSG_COURIER_ENVELOPE,
+                                  recipient, payload, len, 7, true) == ESP_OK;
+    if (sent) {
+        /* Every successful outgoing courier handoff counts once, including
+         * direct-owner delivery, routed-owner forwarding, and carrier spray. */
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_DELIVERED);
+    }
+    return sent;
 }
 
 static bool announce_iter(const uint8_t key[BITLE_STORE_KEY_LEN], uint32_t expiry_s,
@@ -342,7 +350,7 @@ void bitle_courier_peer_announced(uint16_t conn_handle, const uint8_t peer_id[8]
                                   const uint8_t noise_key[32], bool verified,
                                   bool is_direct, uint64_t now_ms)
 {
-    if (!verified || bitle_store_count() == 0) {
+    if (!s_available || !verified || bitle_store_count() == 0) {
         return;
     }
     uint8_t tags[3][TAG_LEN];
@@ -399,27 +407,39 @@ bool bitle_courier_accept(uint16_t conn_handle, const uint8_t depositor[8],
                           uint16_t payload_len, uint64_t now_ms)
 {
     (void)conn_handle;
+    if (!s_available) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
+        ESP_LOGW(TAG, "Rejected deposit while mailbox is unavailable");
+        return false;
+    }
     if (!depositor_verified) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         ESP_LOGW(TAG, "Rejected deposit from unverified peer");
         return false;
     }
     envelope_t env;
     if (!parse_envelope(payload, payload_len, &env)) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         ESP_LOGW(TAG, "Malformed envelope rejected");
         return false;
     }
     if (now_ms >= env.expiry_ms) {
+        /* Expired-at-arrival is separate from policy/auth rejection. */
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_EXPIRED);
         return false; /* expired (inclusive, mirrors upstream) */
     }
     if (env.expiry_ms > now_ms + (uint64_t)MAX_LIFETIME_S * 1000ULL) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         ESP_LOGW(TAG, "Envelope lifetime beyond cap; rejected");
         return false;
     }
     if ((uint32_t)payload_len + DEPOSITOR_LEN > BITLE_STORE_PAYLOAD_MAX) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         ESP_LOGW(TAG, "Envelope too large for mailbox (%u); rejected", payload_len);
         return false;
     }
     if (bitle_store_count() >= BITLE_COURIER_MAX_ENVELOPES) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         ESP_LOGW(TAG, "Mailbox full (%u); rejected", (unsigned)bitle_store_count());
         return false;
     }
@@ -427,12 +447,14 @@ bool bitle_courier_accept(uint16_t conn_handle, const uint8_t depositor[8],
     uint8_t key[BITLE_STORE_KEY_LEN];
     envelope_key(&env, key);
     if (bitle_store_contains(key)) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_DEDUPLICATED);
         return true; /* idempotent re-deposit */
     }
 
     depositor_count_ctx_t dctx = {.depositor = depositor};
     bitle_store_iterate(depositor_count_iter, &dctx);
     if (dctx.count >= BITLE_COURIER_MAX_PER_DEPOSITOR) {
+        bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);
         ESP_LOGW(TAG, "Depositor quota reached; rejected");
         return false;
     }
@@ -445,6 +467,7 @@ bool bitle_courier_accept(uint16_t conn_handle, const uint8_t depositor[8],
                         DEPOSITOR_LEN + payload_len) != ESP_OK) {
         return false;
     }
+    bitle_metrics_increment(BITLE_METRIC_PACKETS_STORED);
     ESP_LOGI(TAG, "Envelope deposited (%u B ciphertext, %u cop%s, mailbox %u/%u)",
              env.ciphertext_len, env.copies, env.copies == 1 ? "y" : "ies",
              (unsigned)bitle_store_count(), BITLE_COURIER_MAX_ENVELOPES);
@@ -454,5 +477,13 @@ bool bitle_courier_accept(uint16_t conn_handle, const uint8_t depositor[8],
 esp_err_t bitle_courier_init(void)
 {
     memset(s_side, 0, sizeof(s_side));
-    return bitle_store_init();
+    s_available = false;
+    esp_err_t err = bitle_store_init();
+    s_available = err == ESP_OK;
+    return err;
+}
+
+bool bitle_courier_is_available(void)
+{
+    return s_available;
 }

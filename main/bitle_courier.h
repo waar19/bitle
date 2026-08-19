@@ -25,6 +25,7 @@ extern "C" {
 #define BITLE_COURIER_MAX_PER_DEPOSITOR  8
 
 esp_err_t bitle_courier_init(void);
+bool bitle_courier_is_available(void);
 
 /* Deposit handler; called on the noise worker task with the depositor's
  * link identity already resolved. Returns true if stored. */

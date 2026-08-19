@@ -105,6 +105,11 @@ bool noise_announce_link(uint16_t link_handle);
 /* Sends the authenticated HearthBit node-role capability. The long-range bit
  * is asserted only after the SX1262 trunk is operational. */
 bool noise_send_node_capability(uint16_t link_handle, bool has_long_range_trunk);
+/* Pure payload builder and boot self-test for mailbox-dependent node roles. */
+void noise_build_node_capability_payload(bool mailbox_available,
+                                         bool has_long_range_trunk,
+                                         uint8_t payload[3]);
+bool noise_node_capability_self_test(void);
 
 /* Identity of the direct peer on a connection, learned from its announce.
  * Returns false until a direct announce has been parsed. *verified reflects
