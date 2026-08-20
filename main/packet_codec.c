@@ -26,7 +26,8 @@ static uint8_t *inflate_payload_mode(const uint8_t *in, size_t in_len, size_t ou
     tinfl_init(&s_inflator);
     size_t consumed = in_len;
     size_t produced = out_len;
-    uint32_t flags = TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+    uint32_t flags = TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF |
+                     TINFL_FLAG_HAS_MORE_INPUT;
     if (parse_zlib) {
         flags |= TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_COMPUTE_ADLER32;
     }
