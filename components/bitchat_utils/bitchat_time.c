@@ -74,6 +74,15 @@ static uint64_t load_epoch_base(void)
 
 static uint64_t build_epoch_ms(void)
 {
+#ifdef HBIT_BUILD_EPOCH_SECONDS
+    const uint64_t configured_epoch = (uint64_t)HBIT_BUILD_EPOCH_SECONDS;
+    if (configured_epoch >= MIN_VALID_EPOCH_SECONDS) {
+        return configured_epoch * 1000ULL;
+    }
+#endif
+
+    /* Fallback for builds outside ESP-IDF's component CMake. __DATE__ and
+     * __TIME__ follow the build host's local timezone. */
     const char *build_date = __DATE__;
     const char *build_time = __TIME__;
     struct tm tm_build = {0};

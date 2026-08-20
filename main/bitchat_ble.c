@@ -164,6 +164,7 @@ static void drop_conn(uint16_t conn_handle)
         return;
     }
     bitle_link_unregister(conn_handle);
+    bitle_mesh_link_disconnected(conn_handle);
     taskENTER_CRITICAL(&s_conn_mux);
     memset(state, 0, sizeof(*state));
     taskEXIT_CRITICAL(&s_conn_mux);

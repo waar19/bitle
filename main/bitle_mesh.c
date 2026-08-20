@@ -24,6 +24,49 @@ static void dispatch_packet(uint16_t link_handle, const bitchat_packet_t *packet
 static uint64_t relay_fingerprint(const uint8_t *data, size_t len);
 static bool relay_seen_before(uint64_t fingerprint);
 
+/* HearthBit private-mode link proof. It is transport negotiation, not a mesh
+ * packet, so consume it before packet decoding and echo it once per BLE
+ * connection. The phone then marks the link as HearthBit and sends ANNOUNCE. */
+static const uint8_t s_hearthbit_link_proof[] = "HB-LINK1";
+
+typedef struct {
+    bool in_use;
+    uint16_t link_handle;
+} hearthbit_proof_link_t;
+
+static hearthbit_proof_link_t s_hearthbit_proof_links[BITLE_LINK_MAX];
+
+static bool reserve_hearthbit_proof_echo(uint16_t link_handle)
+{
+    hearthbit_proof_link_t *free_slot = NULL;
+    for (size_t i = 0; i < BITLE_LINK_MAX; ++i) {
+        if (s_hearthbit_proof_links[i].in_use &&
+            s_hearthbit_proof_links[i].link_handle == link_handle) {
+            return false;
+        }
+        if (!s_hearthbit_proof_links[i].in_use && !free_slot) {
+            free_slot = &s_hearthbit_proof_links[i];
+        }
+    }
+    if (!free_slot) {
+        return false;
+    }
+    free_slot->in_use = true;
+    free_slot->link_handle = link_handle;
+    return true;
+}
+
+static void clear_hearthbit_proof_link(uint16_t link_handle)
+{
+    for (size_t i = 0; i < BITLE_LINK_MAX; ++i) {
+        if (s_hearthbit_proof_links[i].in_use &&
+            s_hearthbit_proof_links[i].link_handle == link_handle) {
+            memset(&s_hearthbit_proof_links[i], 0, sizeof(s_hearthbit_proof_links[i]));
+            return;
+        }
+    }
+}
+
 /* --- Fragment reassembly ---------------------------------------------------
  * Phones fragment packets that exceed the link write budget (a 256-padded
  * packet does not fit ATT_MTU-3 = 253 at MTU 256), so directly connected
@@ -310,10 +353,42 @@ esp_err_t bitle_mesh_init(void)
     return s_lock ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
+void bitle_mesh_link_disconnected(uint16_t link_handle)
+{
+    if (!s_lock) {
+        return;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    clear_hearthbit_proof_link(link_handle);
+    xSemaphoreGive(s_lock);
+}
+
 bool bitle_mesh_inbound(uint16_t link_handle, uint8_t *buffer, uint16_t len)
 {
     /* One complete transport frame entered the mesh, before any decode. */
     bitle_metrics_increment(BITLE_METRIC_PACKETS_RECEIVED);
+    if (len == sizeof(s_hearthbit_link_proof) - 1 &&
+        memcmp(buffer, s_hearthbit_link_proof, sizeof(s_hearthbit_link_proof) - 1) == 0) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        bool should_echo = reserve_hearthbit_proof_echo(link_handle);
+        xSemaphoreGive(s_lock);
+        if (should_echo) {
+            esp_err_t err = bitchat_ble_send(
+                link_handle,
+                s_hearthbit_link_proof,
+                sizeof(s_hearthbit_link_proof) - 1);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "HearthBit link proof accepted conn=%u", link_handle);
+            } else {
+                xSemaphoreTake(s_lock, portMAX_DELAY);
+                clear_hearthbit_proof_link(link_handle);
+                xSemaphoreGive(s_lock);
+                ESP_LOGW(TAG, "HearthBit link proof echo failed conn=%u err=%s",
+                         link_handle, esp_err_to_name(err));
+            }
+        }
+        return true;
+    }
     bitchat_packet_t packet;
     if (!bitchat_packet_decode(buffer, len, &packet)) {
         bitle_metrics_increment(BITLE_METRIC_PACKETS_REJECTED);

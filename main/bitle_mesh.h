@@ -22,6 +22,9 @@ extern "C" {
 
 esp_err_t bitle_mesh_init(void);
 
+/* Clears per-link transport negotiation state when a connection closes. */
+void bitle_mesh_link_disconnected(uint16_t link_handle);
+
 /* Decodes, dispatches locally, ingests for gossip sync, and relays one
  * inbound packet. buffer must hold the full encoded packet and be
  * writable (the relay path rewrites the TTL byte in place). Returns
