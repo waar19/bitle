@@ -289,6 +289,7 @@ static bool build_status(const char *nickname,
     bitle_metrics_snapshot(&metrics);
     size_t nickname_len = nickname ? strnlen(nickname, 31) : 0;
     uint8_t fixed[1 + 4 + 4 + (8 * 10) + 2 + 2 + 3 + 1];
+    uint8_t heap[8];
     size_t p = 0;
     fixed[p++] = s_claimed ? 1 : 0;
     put_u32(fixed + p, metrics.firmware_version); p += 4;
@@ -309,8 +310,11 @@ static bool build_status(const char *nickname,
     fixed[p++] = bitchat_time_is_valid() ? 1 : 0;
     fixed[p++] = bitchat_time_is_authoritative() ? 1 : 0;
     fixed[p++] = (uint8_t)nickname_len;
+    put_u32(heap, esp_get_free_heap_size());
+    put_u32(heap + 4, esp_get_minimum_free_heap_size());
     return append_bytes(response, capacity, offset, fixed, p) &&
-           append_bytes(response, capacity, offset, nickname, nickname_len);
+           append_bytes(response, capacity, offset, nickname, nickname_len) &&
+           append_bytes(response, capacity, offset, heap, sizeof(heap));
 }
 
 static bool verify_request(uint16_t conn_handle,
