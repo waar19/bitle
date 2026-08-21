@@ -26,7 +26,9 @@ A single node runs a genuinely simultaneous **dual-role BLE stack** on NimBLE. I
 
 - **BLE-derived clock with phone-authoritative time.** Bitle has no RTC. Wall-clock time is reconstructed as a persisted epoch base (seeded from the firmware build timestamp, never earlier) plus the ESP32 monotonic timer, then corrected from timestamps harvested *only* from directly-connected peers (relayed/replayed timestamps are ignored). A two-bit authority model (announce TLV `0xB1`) ranks sources: phones are the top authority and may correct even an already-synced clock, while relay nodes only carry real time forward once they themselves trace to a phone. An anti-poison anchor caps forward drift to real-time speed, a 30 s skew window keeps the clock well inside the ±120 s window iOS accepts, and the estimate is persisted to NVS so reboots resume from the last known time instead of rewinding by uptime.
 
-- **Deterministic `Bitle-####` nicknames.** On first boot a node derives a display nickname of the form `Bitle-####` (four decimal digits, mod 10000) from its own peer ID, and carries it in identity announces. A custom 1–31-char printable-ASCII name written to NVS is honored verbatim; a legacy `anon####` name is migrated to the branded form without touching the identity keypair. Note: the suffix is only four digits, so nicknames are not guaranteed unique across nodes. There is currently no wired-up runtime command to set or regenerate a nickname — custom names must be provisioned by writing the NVS `nickname` key directly.
+- **Deterministic `Bitle-####` nicknames.** On first boot a node derives a display nickname of the form `Bitle-####` (four decimal digits, mod 10000) from its own peer ID, and carries it in identity announces. A custom 1–31-char printable-ASCII name written to NVS is honored verbatim; a legacy `anon####` name is migrated to the branded form without touching the identity keypair. HearthBit can rename a claimed node over its encrypted administration channel. Note: the suffix is only four digits, so nicknames are not guaranteed unique across nodes.
+
+- **Encrypted administration.** Firmware v6 exposes status, password setup/change, rename, restart, and factory reset as internal Noise payload `0x31`; it does not add a BLE UUID or alter the BitChat packet format. The phone derives a 32-byte verifier with PBKDF2-HMAC-SHA256 (120,000 iterations), while the node stores only salt and verifier. Protected commands use one-time per-request challenges and HMAC proofs, with persistent exponential lockout after five failures.
 
 - **Autonomous by design.** Once flashed the firmware advertises, accepts connections, relays, and keeps the mesh alive indefinitely with no supervision. Direct messages addressed to the node get a delivery ack and exactly one canned auto-reply per session (identifying Bitle as a relay and citing bitle.org); a chatty sender cannot cause ping-pong.
 
@@ -47,7 +49,7 @@ Radio: **Semtech SX1262** (Seeed Wio-SX1262 + XIAO ESP32-S3), +22 dBm, 902–928
 
 ## Boot sequence
 
-`app_main()` runs a fixed init order: NVS → PSA crypto (with SHA-256/HMAC known-answer self-tests) → time → Noise → OTA → sync → courier → packet codec (with self-test) → link registry → mesh core → LoRa (radio-optional) → BLE init → BLE start, then spawns a single `bitle_main` FreeRTOS task that polls BLE, Noise, and the clock every 50 ms. Most init steps are fatal on failure (`ESP_ERROR_CHECK` / `abort`); the courier mailbox is the one optional subsystem — if it can't start, the node logs a warning and continues without store-and-forward. If NVS reports a layout/version change, the flash is erased and re-initialized rather than bricking boot.
+`app_main()` runs a fixed init order: NVS → PSA crypto (with SHA-256/HMAC known-answer self-tests) → time → Noise → administration → OTA → sync → courier → packet codec (with self-test) → link registry → mesh core → LoRa (radio-optional) → BLE init → BLE start, then spawns a single `bitle_main` FreeRTOS task that polls BLE, Noise, administration, and the clock every 50 ms. Most init steps are fatal on failure (`ESP_ERROR_CHECK` / `abort`); the courier mailbox is the one optional subsystem — if it can't start, the node logs a warning and continues without store-and-forward. If NVS reports a layout/version change, the flash is erased and re-initialized rather than bricking boot.
 
 ## Serial metrics
 
@@ -79,6 +81,7 @@ The node emits one stable `HBIT_METRICS key=value ...` line during boot and abou
     ├── noise_handshake.{c,h}   # Noise XX, announce TLVs, message dispatch
     ├── packet_codec.{c,h}      # BitChat binary packet encode/decode
     ├── bitle_hash.{c,h}        # SHA-256/HMAC via PSA (mbedTLS 3.x & 4.x compatible)
+    ├── bitle_admin.{c,h}       # password-protected administration over Noise
     ├── bitle_ota.{c,h}         # dual-slot OTA, signed manifests
     ├── ota_owner_pubkey.h      # baked-in owner public key (generated)
     ├── bitle_courier.{c,h}     # store-and-forward courier mailbox

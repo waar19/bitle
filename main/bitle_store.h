@@ -50,6 +50,10 @@ void bitle_store_delete(const uint8_t key[BITLE_STORE_KEY_LEN]);
 bool bitle_store_contains(const uint8_t key[BITLE_STORE_KEY_LEN]);
 size_t bitle_store_count(void);
 
+/* Erases every mailbox record and reinitializes the ring. Intended only for
+ * an authenticated factory reset. */
+esp_err_t bitle_store_clear(void);
+
 #ifdef __cplusplus
 }
 #endif

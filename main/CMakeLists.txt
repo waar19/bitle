@@ -7,6 +7,7 @@ idf_component_register(
         "nickname_manager.c"
         "bitle_hash.c"
         "bitle_metrics.c"
+        "bitle_admin.c"
         "bitle_link.c"
         "bitle_mesh.c"
         "bitle_lora.c"

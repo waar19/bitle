@@ -16,6 +16,7 @@
 
 #include "bitchat_ble.h"
 #include "bitchat_time.h"
+#include "bitle_admin.h"
 #include "bitle_courier.h"
 #include "bitle_lora.h"
 #include "bitle_metrics.h"
@@ -51,6 +52,7 @@
 #define NOISE_MAX_ENCRYPTED_PAYLOAD 320
 #define ANNOUNCE_INTERVAL_MS      (10 * 1000ULL)
 #define NODE_CAPABILITY_VERSION   0x01
+#define HBT_CAPABILITY_VERSION    0x01
 #define NODE_ROLE_INFRA_RELAY     0x03
 #define NODE_ROLE_INFRA_DATA_ANCHOR 0x04
 #define NODE_FLAG_RELAY           0x01
@@ -71,6 +73,7 @@ static uint8_t s_peer_id[8];
 static uint8_t s_ed25519_private[32];
 static uint8_t s_ed25519_public[32];
 static char s_nickname[32];
+static portMUX_TYPE s_nickname_lock = portMUX_INITIALIZER_UNLOCKED;
 
 typedef struct {
     bool in_use;
@@ -175,6 +178,21 @@ static void handshake_task(void *arg);
 static bool init_worker(void);
 static void poll_session_maintenance(void);
 static bool try_send_identity(noise_session_t *session);
+
+static void nickname_snapshot(char output[sizeof(s_nickname)])
+{
+    portENTER_CRITICAL(&s_nickname_lock);
+    memcpy(output, s_nickname, sizeof(s_nickname));
+    portEXIT_CRITICAL(&s_nickname_lock);
+    output[sizeof(s_nickname) - 1] = '\0';
+}
+
+static void nickname_update(const char *nickname)
+{
+    portENTER_CRITICAL(&s_nickname_lock);
+    strlcpy(s_nickname, nickname, sizeof(s_nickname));
+    portEXIT_CRITICAL(&s_nickname_lock);
+}
 
 static void load_identity(void)
 {
@@ -534,7 +552,9 @@ static size_t apply_pkcs7_padding(uint8_t *buffer, size_t buffer_len, size_t cur
 
 static bool build_identity_payload(uint8_t *buffer, size_t buffer_len, size_t *out_len)
 {
-    size_t nickname_len = strnlen(s_nickname, sizeof(s_nickname));
+    char nickname[sizeof(s_nickname)];
+    nickname_snapshot(nickname);
+    size_t nickname_len = strnlen(nickname, sizeof(nickname));
     if (nickname_len > 255) {
         nickname_len = 255;
     }
@@ -563,7 +583,7 @@ static bool build_identity_payload(uint8_t *buffer, size_t buffer_len, size_t *o
     offset += sizeof(s_ed25519_public);
 
     buffer[offset++] = (uint8_t)nickname_len;
-    memcpy(buffer + offset, s_nickname, nickname_len);
+    memcpy(buffer + offset, nickname, nickname_len);
     offset += nickname_len;
 
     buffer[offset++] = 0x00; // previousPeerID length
@@ -614,7 +634,9 @@ static bool build_identity_payload(uint8_t *buffer, size_t buffer_len, size_t *o
 
 static bool build_announce_payload(uint8_t *buffer, size_t buffer_len, size_t *out_len)
 {
-    size_t nickname_len = strnlen(s_nickname, sizeof(s_nickname));
+    char nickname[sizeof(s_nickname)];
+    nickname_snapshot(nickname);
+    size_t nickname_len = strnlen(nickname, sizeof(nickname));
     if (nickname_len > 255) {
         nickname_len = 255;
     }
@@ -628,7 +650,7 @@ static bool build_announce_payload(uint8_t *buffer, size_t buffer_len, size_t *o
     size_t offset = 0;
     buffer[offset++] = 0x01;
     buffer[offset++] = (uint8_t)nickname_len;
-    memcpy(buffer + offset, s_nickname, nickname_len);
+    memcpy(buffer + offset, nickname, nickname_len);
     offset += nickname_len;
 
     buffer[offset++] = 0x02;
@@ -925,6 +947,18 @@ static bool send_announce(noise_session_t *session)
         ESP_LOGW(TAG, "Failed to send NODE_CAPABILITY conn=%u", session->conn_handle);
         return false;
     }
+    const uint8_t hbt_capability = HBT_CAPABILITY_VERSION;
+    if (noise_send_packet(
+            session->conn_handle,
+            BITCHAT_MSG_HBT_CAPABILITY,
+            NULL,
+            &hbt_capability,
+            sizeof(hbt_capability),
+            NOISE_PACKET_TTL,
+            true) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to send HBT_CAPABILITY conn=%u", session->conn_handle);
+        return false;
+    }
 
     session->last_announce_ms = esp_timer_get_time() / 1000ULL;
     ESP_LOGI(TAG, "conn=%u sent ANNOUNCE (%u bytes)", session->conn_handle, (unsigned)announce_len);
@@ -1210,6 +1244,46 @@ static void handle_noise_payload(uint16_t conn_handle, const noise_event_t *evt,
     }
     uint8_t payload_type = decrypted[0];
     ESP_LOGI(TAG, "Encrypted payload type=0x%02X len=%u", payload_type, (unsigned)(decrypted_len - 1));
+    if (payload_type == BITCHAT_NOISE_PAYLOAD_ANCHOR_ADMIN) {
+        uint8_t response[BITLE_ADMIN_MAX_RESPONSE];
+        size_t response_len = 0;
+        bitle_admin_result_t result;
+        char nickname[sizeof(s_nickname)];
+        nickname_snapshot(nickname);
+        if (!bitle_admin_handle(
+                conn_handle,
+                decrypted + 1,
+                decrypted_len - 1,
+                nickname,
+                response,
+                sizeof(response),
+                &response_len,
+                &result)) {
+            ESP_LOGW(TAG, "Malformed admin frame from conn=%u", conn_handle);
+            return;
+        }
+        if (!noise_send_encrypted(
+                conn_handle,
+                BITCHAT_NOISE_PAYLOAD_ANCHOR_ADMIN,
+                response,
+                response_len)) {
+            ESP_LOGW(TAG, "Admin response send failed conn=%u", conn_handle);
+            return;
+        }
+        if (result.restart_requested) {
+            bitle_admin_schedule_restart(result.factory_reset_requested);
+        }
+        if (result.nickname_changed) {
+            nickname_update(result.nickname);
+            for (size_t i = 0; i < NOISE_MAX_SESSIONS; ++i) {
+                if (s_sessions[i].in_use) {
+                    s_sessions[i].last_announce_ms = 0;
+                }
+            }
+            send_announce(session);
+        }
+        return;
+    }
     if (payload_type != BITCHAT_NOISE_PAYLOAD_PRIVATE_MESSAGE) {
         return;
     }

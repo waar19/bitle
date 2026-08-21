@@ -7,6 +7,7 @@
 
 #include "bitchat_ble.h"
 #include "bitchat_time.h"
+#include "bitle_admin.h"
 #include "bitle_courier.h"
 #include "bitle_hash.h"
 #include "bitle_link.h"
@@ -34,6 +35,7 @@ static void bitle_main_task(void *arg)
 #endif
         noise_poll();
         bitchat_time_poll();
+        bitle_admin_poll();
 
         uint64_t now_ms = esp_timer_get_time() / 1000ULL;
         if (last_heap_log_ms == 0 || now_ms - last_heap_log_ms > 600000ULL) {
@@ -73,6 +75,11 @@ void app_main(void)
 
     ESP_ERROR_CHECK(bitchat_time_init());
     ESP_ERROR_CHECK(bitchat_noise_init());
+    ESP_ERROR_CHECK(bitle_admin_init());
+    if (!bitle_admin_self_test()) {
+        ESP_LOGE(TAG, "Admin channel self-test failed");
+        abort();
+    }
     ESP_ERROR_CHECK(bitle_ota_init());
     ESP_ERROR_CHECK(bitle_sync_init());
     if (bitle_courier_init() != ESP_OK) {

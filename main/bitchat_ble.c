@@ -24,6 +24,7 @@
 #include "packet_codec.h"
 
 #define BITLE_DEVICE_NAME "Bitle Relay"
+#define BITLE_SCAN_NAME "B"
 #define BITLE_BLE_MAX_CONNECTIONS CONFIG_BT_NIMBLE_MAX_CONNECTIONS
 
 static const char *TAG = "bitchat_ble";
@@ -267,9 +268,11 @@ static void start_advertising(void)
     if (ble_gap_adv_active()) {
         return;
     }
-    /* flags(3) + name(13) + uuid128(18) exceeds the 31-byte legacy advertising
-     * payload, so the service UUID goes in the advertisement (clients scan by
-     * it) and the name in the scan response. */
+    /* The service UUID stays in the advertisement so Android's UUID filter can
+     * discover us. The scan response carries UUID + peer ID as service data;
+     * Android requires that discovery hint before opening a GATT link. A
+     * one-byte name preserves Bitle-to-Bitle discovery within the 31-byte
+     * legacy scan-response limit. */
     struct ble_hs_adv_fields fields;
     memset(&fields, 0, sizeof(fields));
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
@@ -285,8 +288,13 @@ static void start_advertising(void)
 
     struct ble_hs_adv_fields rsp_fields;
     memset(&rsp_fields, 0, sizeof(rsp_fields));
-    rsp_fields.name = (const uint8_t *)BITLE_DEVICE_NAME;
-    rsp_fields.name_len = (uint8_t)strlen(BITLE_DEVICE_NAME);
+    uint8_t service_data[sizeof(s_service_uuid.value) + 8];
+    memcpy(service_data, s_service_uuid.value, sizeof(s_service_uuid.value));
+    memcpy(service_data + sizeof(s_service_uuid.value), noise_get_local_peer_id(), 8);
+    rsp_fields.svc_data_uuid128 = service_data;
+    rsp_fields.svc_data_uuid128_len = sizeof(service_data);
+    rsp_fields.name = (const uint8_t *)BITLE_SCAN_NAME;
+    rsp_fields.name_len = (uint8_t)strlen(BITLE_SCAN_NAME);
     rsp_fields.name_is_complete = 1;
 
     rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
@@ -442,8 +450,8 @@ static void maybe_connect_to_bitle(const struct ble_gap_disc_desc *disc)
     if (ble_hs_adv_parse_fields(&fields, disc->data, disc->length_data) != 0) {
         return;
     }
-    if (fields.name_len != strlen(BITLE_DEVICE_NAME) ||
-        memcmp(fields.name, BITLE_DEVICE_NAME, fields.name_len) != 0) {
+    if (fields.name_len != strlen(BITLE_SCAN_NAME) ||
+        memcmp(fields.name, BITLE_SCAN_NAME, fields.name_len) != 0) {
         return; /* phones and other peripherals: connect to us, not us to them */
     }
     if (addr_denied(&disc->addr, now) || already_linked_to(&disc->addr)) {

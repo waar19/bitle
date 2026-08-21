@@ -328,6 +328,25 @@ size_t bitle_store_count(void)
     return count;
 }
 
+esp_err_t bitle_store_clear(void)
+{
+    if (!s_part || !s_lock) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    esp_err_t err = esp_partition_erase_range(s_part, 0, s_part->size);
+    if (err == ESP_OK) {
+        memset(s_index, 0, sizeof(s_index));
+        s_index_count = 0;
+        s_write_off = 0;
+        s_next_seq = 0;
+        s_head_seq = 0;
+        err = open_sector(0);
+    }
+    xSemaphoreGive(s_lock);
+    return err;
+}
+
 esp_err_t bitle_store_init(void)
 {
     s_part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x41, "msgstore");

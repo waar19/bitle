@@ -29,6 +29,7 @@ __pycache__/
 # IDE/editor metadata
 .vscode/
 .idea/
+.cache/
 .DS_Store
 
 # Logs and scratch
