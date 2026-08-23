@@ -12,7 +12,7 @@ Produces <image>.bota - a 110-byte manifest that travels ahead of the image:
 
 Usage:
     python tools/sign_fw.py build/bitle.bin --version 2 \
-        [--key ~/bitle-keys/bitle_owner_key.hex] [--chunk-size 384]
+        [--key ~/bitle-keys/bitle_owner_key.hex] [--chunk-size 472]
 """
 
 import argparse
@@ -32,7 +32,7 @@ def main() -> int:
     parser.add_argument("image", help="firmware .bin to sign")
     parser.add_argument("--version", type=int, required=True, help="monotonic firmware version number")
     parser.add_argument("--key", default=os.path.expanduser("~/bitle-keys/bitle_owner_key.hex"))
-    parser.add_argument("--chunk-size", type=int, default=384)
+    parser.add_argument("--chunk-size", type=int, default=472)
     args = parser.parse_args()
 
     if not 0 < args.version < 2**32:
