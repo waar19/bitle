@@ -68,6 +68,9 @@ void app_main(void)
     }
 
     ESP_LOGI(TAG, "Starting Bitle firmware");
+    /* NimBLE logs every notification at INFO. OTA sends thousands of
+     * notifications, so an unread UART can otherwise throttle the transfer. */
+    esp_log_level_set("NimBLE", ESP_LOG_WARN);
 
     /* Everything below hashes (peer ids, courier tags, sync ids, OTA
      * digests) — bring PSA up and prove it first. */

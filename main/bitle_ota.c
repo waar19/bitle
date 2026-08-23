@@ -196,6 +196,21 @@ static void handle_manifest(const ota_event_t *evt)
         return; /* downgrade: never */
     }
     if (s_rx.active) {
+        if (manifest.version == s_rx.manifest.version &&
+            memcmp(manifest.raw, s_rx.manifest.raw, OTA_MANIFEST_LEN) == 0 &&
+            memcmp(evt->peer, s_rx.peer, sizeof(s_rx.peer)) == 0) {
+            /* A BLE reconnect gets a new connection handle. Re-anchor the
+             * existing sequential write and continue from the pending chunk. */
+            s_rx.conn_handle = evt->conn_handle;
+            s_rx.last_activity_ms = uptime_ms();
+            s_rx.retries = 0;
+            send_req(s_rx.next_chunk);
+            ESP_LOGI(TAG, "OTA v%lu resumed at chunk %lu/%lu",
+                     (unsigned long)manifest.version,
+                     (unsigned long)s_rx.next_chunk,
+                     (unsigned long)s_rx.total_chunks);
+            return;
+        }
         if (manifest.version <= s_rx.manifest.version) {
             return;
         }

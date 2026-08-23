@@ -212,11 +212,15 @@ static bool is_local_recipient(const bitchat_packet_t *packet)
 
 static void dispatch_packet(uint16_t link_handle, const bitchat_packet_t *packet)
 {
-    ESP_LOGI(TAG, "RX conn=%u type=0x%02X len=%u ttl=%u from=%02X%02X%02X%02X to=%s%s",
-             link_handle, packet->type, packet->payload_len, packet->ttl,
-             packet->sender_id[0], packet->sender_id[1], packet->sender_id[2], packet->sender_id[3],
-             is_broadcast_recipient(packet) ? "bcast" : (is_local_recipient(packet) ? "us" : "other"),
-             packet->is_compressed ? " (compressed)" : "");
+    if (packet->type != BITLE_MSG_OTA_CHUNK) {
+        ESP_LOGI(TAG, "RX conn=%u type=0x%02X len=%u ttl=%u from=%02X%02X%02X%02X to=%s%s",
+                 link_handle, packet->type, packet->payload_len, packet->ttl,
+                 packet->sender_id[0], packet->sender_id[1],
+                 packet->sender_id[2], packet->sender_id[3],
+                 is_broadcast_recipient(packet) ? "bcast" :
+                 (is_local_recipient(packet) ? "us" : "other"),
+                 packet->is_compressed ? " (compressed)" : "");
+    }
 
     if (packet->opaque_only) {
         ESP_LOGD(TAG, "v2 packet retained as opaque relay traffic");
